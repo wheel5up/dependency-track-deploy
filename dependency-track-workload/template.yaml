@@ -1,0 +1,627 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Dependency-Track: single-instance ECS (EC2 launch type) cluster running
+  frontend, apiserver, and cloudflared containers in one task with bridge
+  networking (both frontend and apiserver images listen on container port
+  8080 internally -- host networking would collide, so bridge mode is
+  used to remap them to distinct host ports 8080/8081; cloudflared uses
+  container links to reach both by name). All networking (VPC/subnets)
+  and the RDS database are imported from the dependency-track-db stack.
+  User data on the EC2 instance handles infrastructure bootstrap only
+  (ECS cluster join + extra EBS volume mount) -- container definitions,
+  environment variables, and secrets all live declaratively in the ECS
+  Task Definition below, not in user data.
+
+Parameters:
+  DbStackName:
+    Type: String
+    Default: dependency-track-db
+    Description: Stack name of the dependency-track-db stack, used for Fn::ImportValue.
+
+  CloudflareTunnelToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >-
+      Cloudflare tunnel token. Leave blank at initial deploy; the
+      cloudflared container will fail to connect until this is filled in
+      via Secrets Manager and a new ECS deployment is forced (see README).
+
+  PublicApiBaseUrl:
+    Type: String
+    Default: "http://localhost:8081"
+    Description: >-
+      Public HTTPS URL (via the Cloudflare Tunnel) that end-user browsers
+      use to reach the apiserver container -- e.g.
+      https://api-dtrack.example.com. This is baked into the frontend's
+      static JS as API_BASE_URL and is called directly by the browser,
+      NOT container-to-container, so it cannot be a localhost/internal
+      address once the tunnel is live. Requires a second Cloudflare
+      Tunnel ingress rule routing to the apiserver's public hostname (see
+      README). Leave as the localhost default until the tunnel's second
+      ingress rule is configured, then update and redeploy.
+
+  WorkloadAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Pinned ECS-optimized Amazon Linux 2023 AMI (region-specific) for the workload
+      instance. Deliberately NOT an SSM dynamic reference resolving the
+      AWS-managed "recommended" AMI parameter -- that parameter's
+      value changes whenever AWS publishes a new AMI, independent of any
+      change in this template, which would cause CloudFormation to
+      silently replace the EC2 instance (new host, re-join ECS cluster,
+      AND a freshly-formatted/empty data EBS volume since it is defined
+      inline on the instance, not as a separate managed volume -- see
+      DataVolumeSizeGb) on what should be a routine, unrelated deploy.
+      Bump this deliberately (check
+      https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html
+      for the latest) once a plan for preserving/migrating the data
+      volume's contents exists.
+
+  WorkloadSubnetId:
+    Type: String
+    Default: ""
+    Description: >-
+      Subnet for the EC2 instance (NAT-routed, no public IP). Leave blank
+      to use the db stack's first subnet.
+
+  InstanceType:
+    Type: String
+    Default: t3.xlarge
+
+  DataVolumeSizeGb:
+    Type: Number
+    Default: 10
+
+  RootVolumeSizeGb:
+    Type: Number
+    Default: 30
+
+  ApiserverImageTag:
+    Type: String
+    Default: "5.1.0"
+    Description: >-
+      Pinned dependencytrack/apiserver image tag. Do not use "latest" --
+      on v5 images specifically, ":latest" on Docker Hub actually still
+      points at the most recent v4 release (and will keep doing so until
+      v4 reaches EOL in Dec 2026); it does NOT point at the newest v5
+      build. Always use an explicit X.Y.Z tag. Check
+      https://hub.docker.com/r/dependencytrack/apiserver/tags before
+      bumping, and keep in lockstep with FrontendImageTag (both are
+      released together upstream).
+
+  FrontendImageTag:
+    Type: String
+    Default: "5.1.0"
+    Description: >-
+      Pinned dependencytrack/frontend image tag. Keep in lockstep with
+      ApiserverImageTag (both are released together upstream).
+
+  CloudflaredImageTag:
+    Type: String
+    Default: "2026.10.2"
+    Description: >-
+      Pinned cloudflare/cloudflared image tag. Check
+      https://hub.docker.com/r/cloudflare/cloudflared/tags before
+      bumping.
+
+  OidcEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Enables OIDC login. Leave false until the Okta app integration
+      is created and OidcClientId/OidcIssuer below are filled in (see
+      README), then redeploy with true. No client secret is involved
+      anywhere in this integration -- DT's OIDC flow is a public
+      client (SPA) validated via ID token/JWKS, so these are plain
+      parameters, not Secrets Manager entries. Maps to apiserver's
+      DT_OIDC_ENABLED -- v5.1.0 rejects the old v4 ALPINE_OIDC_*
+      names outright at startup (IllegalStateException), it does not
+      just ignore them, so getting this rename right matters.
+
+  OidcClientId:
+    Type: String
+    Default: ""
+    Description: Client ID from the Okta OIDC app integration (see README).
+
+  OidcIssuer:
+    Type: String
+    Default: ""
+    Description: >-
+      Dedicated Okta Authorization Server issuer URL, e.g.
+      https://<okta-domain>/oauth2/<auth-server-id> -- a custom
+      authorization server dedicated to this app (not the shared
+      "default" one, to avoid exposing the groups claim to every
+      other app using it; not the root Org Authorization Server
+      either, since custom claims need a custom authorization server).
+
+  OidcUsernameClaim:
+    Type: String
+    Default: preferred_username
+
+  OidcTeamsClaim:
+    Type: String
+    Default: groups
+
+  OidcUserProvisioning:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Auto-create Dependency-Track users on first OIDC login.
+
+  OidcTeamSynchronization:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Sync Okta group membership (OidcTeamsClaim) to Dependency-Track
+      teams, rather than assigning every OIDC user a fixed default
+      team. Group name -> Team mapping is configured separately in the
+      Dependency-Track admin UI (Administration -> Access Management),
+      not by this parameter.
+
+  OidcScope:
+    Type: String
+    Default: "openid profile email"
+    Description: >-
+      Requested OIDC scopes. Deliberately does NOT include "groups" --
+      scopes and claims are different things on Okta. The groups
+      claim (see the dedicated authorization server's Claims tab) is
+      configured to include in the ID Token unconditionally
+      ("Always"), so it doesn't need to be requested as a scope, and
+      Okta rejects the whole authorize request with invalid_scope if
+      you request a scope name it doesn't recognize as defined on
+      that authorization server -- confirmed via a real login attempt
+      against a custom auth server whose scopes_supported was just
+      openid/profile/email/address/phone/offline_access.
+
+  ApiserverBaseUrlParameterName:
+    Type: String
+    Default: /dependency-track/apiserver-base-url
+    Description: >-
+      SSM parameter this stack writes the in-VPC apiserver URL to. The
+      scanner and catcher stacks read it.
+
+Conditions:
+  UseDbStackSubnet: !Equals [!Ref WorkloadSubnetId, ""]
+
+Resources:
+  # ---------------------------------------------------------------------
+  # Security group egress rules (SG itself is created in the db stack to
+  # avoid a chicken-and-egg dependency with the RDS ingress rule)
+  # ---------------------------------------------------------------------
+
+  EgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: "${DbStackName}-WorkloadSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: >-
+        HTTPS outbound for Cloudflare Tunnel registration/API and Docker
+        Hub image pulls
+
+  EgressCloudflareQuic:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: "${DbStackName}-WorkloadSecurityGroupId"
+      IpProtocol: udp
+      FromPort: 7844
+      ToPort: 7844
+      CidrIp: 0.0.0.0/0
+      Description: >-
+        Cloudflare Tunnel edge connection (QUIC, the preferred protocol
+        for cloudflared) -- without this, cloudflared falls back to
+        trying HTTP/2 on the same port and can fail to connect entirely
+        if that is also blocked.
+
+  EgressCloudflareTcpFallback:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: "${DbStackName}-WorkloadSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: 7844
+      ToPort: 7844
+      CidrIp: 0.0.0.0/0
+      Description: >-
+        Cloudflare Tunnel edge connection (HTTP/2 fallback when QUIC/UDP
+        is unavailable)
+
+  EgressPostgres:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: "${DbStackName}-WorkloadSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !ImportValue
+        Fn::Sub: "${DbStackName}-RdsSecurityGroupId"
+      Description: Postgres outbound to RDS
+
+  # ---------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------
+
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2InstanceRole
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: dependency-track-secrets-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "${DbStackName}-DbSecretArn"
+                  - !Ref CloudflareTunnelTokenSecret
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # Secrets
+  # ---------------------------------------------------------------------
+
+  CloudflareTunnelTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: dependency-track/cloudflare-tunnel-token
+      Description: >-
+        Cloudflare Tunnel token. Placeholder at stack creation -- fill in
+        via the AWS Console/CLI after creating the tunnel in the
+        Cloudflare dashboard, then force a new ECS deployment.
+      SecretString: !Sub '{"token":"${CloudflareTunnelToken}"}'
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # ECS Cluster
+  # ---------------------------------------------------------------------
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: dependency-track-cluster
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # EC2 instance (ECS container instance)
+  # ---------------------------------------------------------------------
+
+  WorkloadInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref WorkloadAmiId
+      SubnetId: !If
+        - UseDbStackSubnet
+        - !ImportValue
+          Fn::Sub: "${DbStackName}-WorkloadSubnet1Id"
+        - !Ref WorkloadSubnetId
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${DbStackName}-WorkloadSecurityGroupId"
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSizeGb
+            VolumeType: gp3
+            Encrypted: true
+        - DeviceName: /dev/sdf
+          Ebs:
+            VolumeSize: !Ref DataVolumeSizeGb
+            VolumeType: gp3
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Infrastructure bootstrap ONLY: join the ECS cluster and mount
+          # the extra data volume. No docker-compose, no app config, no
+          # secrets here -- those live in the ECS Task Definition.
+          set -euxo pipefail
+
+          echo "ECS_CLUSTER=${EcsCluster}" >> /etc/ecs/ecs.config
+
+          # Format + mount the extra EBS volume for the NVD/apiserver data
+          # dir. t3.xlarge is a Nitro instance type, so the DeviceName
+          # given in BlockDeviceMappings (/dev/sdf) is NOT preserved --
+          # the volume shows up as an NVMe device (e.g. /dev/nvme1n1)
+          # instead. Identify it as the non-root NVMe block device.
+          ROOT_DEV=$(findmnt -n -o SOURCE / | sed -E 's/p?[0-9]+$//')
+          DEVICE=""
+          for d in /dev/nvme*n1; do
+            if [ "$d" != "$ROOT_DEV" ]; then
+              DEVICE="$d"
+              break
+            fi
+          done
+          if [ -z "$DEVICE" ]; then
+            echo "ERROR: could not identify data volume device" >&2
+            exit 1
+          fi
+          if ! blkid "$DEVICE" >/dev/null 2>&1; then
+            mkfs -t xfs "$DEVICE"
+          fi
+          mkdir -p /opt/dtrack-data
+          mount "$DEVICE" /opt/dtrack-data
+          echo "$DEVICE /opt/dtrack-data xfs defaults,nofail 0 2" >> /etc/fstab
+          chmod 777 /opt/dtrack-data
+
+          systemctl enable --now ecs
+      Tags:
+        - Key: Name
+          Value: dependency-track-workload
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # ECS Task Definition + Service
+  # ---------------------------------------------------------------------
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: dependency-track
+      # Bridge (not host) networking: both apiserver and frontend images
+      # listen on container port 8080 internally (not configurable via
+      # env var), which would collide under host networking since
+      # HostPort must equal ContainerPort there. Bridge mode lets ECS
+      # remap them to distinct host ports (8081 / 8080). cloudflared
+      # reaches the other two containers by name via Links (only
+      # supported in bridge mode).
+      NetworkMode: bridge
+      RequiresCompatibilities:
+        - EC2
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      Volumes:
+        - Name: dtrack-data
+          Host:
+            SourcePath: /opt/dtrack-data
+      ContainerDefinitions:
+        - Name: apiserver
+          Image: !Sub "dependencytrack/apiserver:${ApiserverImageTag}"
+          Essential: true
+          MemoryReservation: 8192
+          MountPoints:
+            - SourceVolume: dtrack-data
+              ContainerPath: /data
+          PortMappings:
+            # apiserver listens on 8080 inside the container; map to host
+            # 8081 so it doesn't collide with frontend's host port 8080.
+            - ContainerPort: 8080
+              HostPort: 8081
+              Protocol: tcp
+          Environment:
+            # v5 renamed all ALPINE_* config to DT_*, and dropped the
+            # separate "mode" and "driver" vars entirely -- the driver is
+            # now inferred from the JDBC URL scheme.
+            - Name: DT_DATASOURCE_URL
+              Value: !Sub
+                - "jdbc:postgresql://${Endpoint}:${Port}/dtrack"
+                - Endpoint: !ImportValue
+                    Fn::Sub: "${DbStackName}-RdsEndpoint"
+                  Port: !ImportValue
+                    Fn::Sub: "${DbStackName}-RdsPort"
+            # OIDC (Okta) -- see README for the Okta-side app
+            # registration steps. No client secret anywhere in this
+            # integration: DT validates OIDC as a public client (SPA)
+            # via ID token/JWKS, so these are plain, non-sensitive
+            # config values, not Secrets Manager entries. DT_OIDC_* is
+            # the current (v5.1.0) property namespace -- the old v4
+            # ALPINE_OIDC_* names are hard-rejected at startup, not
+            # just ignored (see LegacyConfigPropertyValidator upstream).
+            - Name: DT_OIDC_ENABLED
+              Value: !Ref OidcEnabled
+            - Name: DT_OIDC_CLIENT_ID
+              Value: !Ref OidcClientId
+            - Name: DT_OIDC_ISSUER
+              Value: !Ref OidcIssuer
+            - Name: DT_OIDC_USERNAME_CLAIM
+              Value: !Ref OidcUsernameClaim
+            - Name: DT_OIDC_USER_PROVISIONING
+              Value: !Ref OidcUserProvisioning
+            - Name: DT_OIDC_TEAMS_CLAIM
+              Value: !Ref OidcTeamsClaim
+            - Name: DT_OIDC_TEAM_SYNCHRONIZATION
+              Value: !Ref OidcTeamSynchronization
+          Secrets:
+            - Name: DT_DATASOURCE_USERNAME
+              ValueFrom: !Sub
+                - "${SecretArn}:username::"
+                - SecretArn: !ImportValue
+                    Fn::Sub: "${DbStackName}-DbSecretArn"
+            - Name: DT_DATASOURCE_PASSWORD
+              ValueFrom: !Sub
+                - "${SecretArn}:password::"
+                - SecretArn: !ImportValue
+                    Fn::Sub: "${DbStackName}-DbSecretArn"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: apiserver
+
+        - Name: frontend
+          Image: !Sub "dependencytrack/frontend:${FrontendImageTag}"
+          Essential: true
+          MemoryReservation: 512
+          Links:
+            - apiserver
+          DependsOn:
+            - ContainerName: apiserver
+              Condition: START
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+              Protocol: tcp
+          Environment:
+            # Browser-facing URL, NOT container-to-container -- the
+            # frontend serves static JS that the end user's browser calls
+            # directly. Must be the public Cloudflare Tunnel hostname
+            # routed to apiserver once the tunnel is configured (see
+            # PublicApiBaseUrl parameter description and README). Left as
+            # localhost until then, which only works for direct
+            # host-network testing, not through the tunnel.
+            - Name: API_BASE_URL
+              Value: !Ref PublicApiBaseUrl
+            # OIDC (Okta). Reuses the same OidcClientId/OidcIssuer
+            # parameters as the apiserver container so the two can't
+            # drift out of sync. Confirmed against
+            # docker-entrypoint.d/30-oidc-configuration.sh in the
+            # frontend image source -- these OIDC_* names are a
+            # separate (JS/nginx) config path from the apiserver's
+            # Java properties, so they're unaffected by the DT_*
+            # rename above. No OIDC_FLOW -- DT's docs call that out as
+            # Google-specific; Okta uses the default Authorization
+            # Code + PKCE flow.
+            - Name: OIDC_CLIENT_ID
+              Value: !Ref OidcClientId
+            - Name: OIDC_ISSUER
+              Value: !Ref OidcIssuer
+            - Name: OIDC_SCOPE
+              Value: !Ref OidcScope
+            - Name: OIDC_LOGIN_BUTTON_TEXT
+              Value: "Login with Okta"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: frontend
+
+        - Name: cloudflared
+          Image: !Sub "cloudflare/cloudflared:${CloudflaredImageTag}"
+          # Not essential: with a blank TUNNEL_TOKEN (initial deploy,
+          # before the operator fills in the real token from the
+          # Cloudflare dashboard) this container exits immediately. If it
+          # were Essential, ECS would kill the whole task (including the
+          # healthy apiserver/frontend containers) and crash-loop
+          # forever. Marking it non-essential lets apiserver/frontend run
+          # fine on their own; cloudflared will start succeeding once the
+          # real token is set and a new deployment is forced (see README).
+          Essential: false
+          MemoryReservation: 256
+          Links:
+            - frontend
+            - apiserver
+          DependsOn:
+            - ContainerName: frontend
+              Condition: START
+          Command:
+            - tunnel
+            - --no-autoupdate
+            - run
+          Secrets:
+            - Name: TUNNEL_TOKEN
+              ValueFrom: !Sub "${CloudflareTunnelTokenSecret}:token::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: cloudflared
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # SSM rather than a stack export: an export can't change while another
+  # stack imports it, and this changes whenever the instance is replaced.
+  # Consumers resolve it at deploy time, so redeploy them after a
+  # replacement.
+  ApiserverBaseUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref ApiserverBaseUrlParameterName
+      Type: String
+      Description: In-VPC Dependency-Track apiserver URL (instance private IP + host port).
+      Value: !Sub "http://${WorkloadInstance.PrivateIp}:8081"
+      Tags:
+        Project: dependency-track
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/dependency-track
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: WorkloadInstance
+    Properties:
+      ServiceName: dependency-track
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: EC2
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+Outputs:
+  ClusterName:
+    Value: !Ref EcsCluster
+
+  ServiceName:
+    Value: !GetAtt EcsService.Name
+
+  InstanceId:
+    Value: !Ref WorkloadInstance
+
+  CloudflareTunnelTokenSecretArn:
+    Value: !Ref CloudflareTunnelTokenSecret
+
+  ApiserverBaseUrl:
+    Value: !GetAtt ApiserverBaseUrlParameter.Value

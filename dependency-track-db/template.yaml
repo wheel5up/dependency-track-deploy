@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Dependency-Track: RDS PostgreSQL database and supporting networking
+  security groups. Deployed into an existing VPC (VPC is not created by
+  this template). Outputs are exported for import by the
+  dependency-track-workload stack.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC to deploy RDS into.
+
+  DbSubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Existing private subnet (NAT-routed, no public IP). Also exported
+      as the default workload subnet.
+
+  DbSubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second existing private subnet, in a different AZ from DbSubnetId1.
+
+  DbSnapshotIdentifier:
+    Type: String
+    Default: ""
+    Description: >-
+      Snapshot ARN to restore from. Leave blank for a new, empty
+      database. Once set, never change or remove it: CloudFormation
+      would replace the database. The restored DB keeps the snapshot's
+      master password, so set the db-credentials secret to match.
+
+  DbName:
+    Type: String
+    Default: dtrack
+
+  DbMasterUsername:
+    Type: String
+    Default: dtrack
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.medium
+
+  DbAllocatedStorage:
+    Type: Number
+    Default: 40
+    Description: >-
+      Allocated storage in GB. RDS storage can only grow, so keep this
+      at or above the live size (autoscaling raises it). When restoring,
+      it must be at least the snapshot's allocated storage. Most of
+      Dependency-Track's DB growth is daily component metrics; size
+      against metrics.retention.days.
+
+  DbMaxAllocatedStorage:
+    Type: Number
+    Default: 100
+    Description: >-
+      Storage autoscaling ceiling in GB. RDS grows allocated storage up
+      to this as usage demands.
+
+Conditions:
+  RestoreFromSnapshot: !Not [!Equals [!Ref DbSnapshotIdentifier, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------------
+
+  WorkloadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: dependency-track-workload-sg
+      GroupDescription: >-
+        Dependency-Track EC2 workload SG. Created here (not in the
+        workload stack) to avoid a chicken-and-egg dependency with the
+        RDS ingress rule below. No ingress rules defined; egress rules
+        are added in the workload stack template.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        # Explicit empty list overrides the EC2 default "allow all outbound"
+        # rule, so this SG starts deny-all-egress. Real egress rules (443
+        # for cloudflared, 5432 to RDS) are added as separate
+        # AWS::EC2::SecurityGroupEgress resources in the workload stack.
+        - IpProtocol: "-1"
+          CidrIp: 255.255.255.255/32
+          Description: Deny-all placeholder (unreachable CIDR); real rules added in workload stack.
+      Tags:
+        - Key: Project
+          Value: dependency-track
+        - Key: Name
+          Value: dependency-track-workload-sg
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: dependency-track-rds-sg
+      GroupDescription: Dependency-Track RDS SG. Allows Postgres only from the workload SG.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref WorkloadSecurityGroup
+          Description: Postgres from Dependency-Track workload instance
+      Tags:
+        - Key: Project
+          Value: dependency-track
+        - Key: Name
+          Value: dependency-track-rds-sg
+
+  # ---------------------------------------------------------------------
+  # RDS
+  # ---------------------------------------------------------------------
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: dependency-track-db-subnet-group
+      DBSubnetGroupDescription: Subnet group for Dependency-Track RDS instance
+      SubnetIds:
+        - !Ref DbSubnetId1
+        - !Ref DbSubnetId2
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: dependency-track/db-credentials
+      Description: Dependency-Track RDS master credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DbMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: dependency-track-db
+      Engine: postgres
+      EngineVersion: "15.18"
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      MaxAllocatedStorage: !Ref DbMaxAllocatedStorage
+      StorageType: gp3
+      # When restoring, the KMS key, DB name and master credentials come
+      # from the snapshot and must not be set here.
+      StorageEncrypted: true
+      MultiAZ: false
+      DeletionProtection: false
+      DBSnapshotIdentifier: !If [RestoreFromSnapshot, !Ref DbSnapshotIdentifier, !Ref AWS::NoValue]
+      DBName: !If [RestoreFromSnapshot, !Ref AWS::NoValue, !Ref DbName]
+      MasterUsername: !If
+        - RestoreFromSnapshot
+        - !Ref AWS::NoValue
+        - !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+      MasterUserPassword: !If
+        - RestoreFromSnapshot
+        - !Ref AWS::NoValue
+        - !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref DbInstance
+      TargetType: AWS::RDS::DBInstance
+
+Outputs:
+  PublicSubnet1Id:
+    Description: >-
+      Kept for naming continuity with original spec; actually the first
+      NAT-routed (no public IP) subnet used for the workload instance.
+    Value: !Ref DbSubnetId1
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkloadSubnet1Id"
+
+  PublicSubnet2Id:
+    Description: Second NAT-routed subnet (available for future ASG use).
+    Value: !Ref DbSubnetId2
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkloadSubnet2Id"
+
+  VpcId:
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  RdsEndpoint:
+    Value: !GetAtt DbInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-RdsEndpoint"
+
+  RdsPort:
+    Value: !GetAtt DbInstance.Endpoint.Port
+    Export:
+      Name: !Sub "${AWS::StackName}-RdsPort"
+
+  DbSecretArn:
+    Value: !Ref DbSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-DbSecretArn"
+
+  WorkloadSecurityGroupId:
+    Value: !Ref WorkloadSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkloadSecurityGroupId"
+
+  RdsSecurityGroupId:
+    Value: !Ref RdsSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-RdsSecurityGroupId"

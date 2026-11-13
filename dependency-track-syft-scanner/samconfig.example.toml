@@ -1,0 +1,13 @@
+# Copy to samconfig.toml (gitignored). Deploy after dependency-track-workload,
+# which writes the apiserver URL to SSM.
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "dependency-track-syft-scanner"
+region = "us-east-1"
+capabilities = "CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+resolve_image_repos = true
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "DbStackName=dependency-track-db"

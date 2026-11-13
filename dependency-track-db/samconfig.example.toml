@@ -1,0 +1,13 @@
+# Copy to samconfig.toml (gitignored) and fill in the placeholders.
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "dependency-track-db"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+confirm_changeset = true
+fail_on_empty_changeset = false
+# Add DbSnapshotIdentifier=<snapshot-arn> to restore from a snapshot.
+# Once set, never change or remove it (CloudFormation would replace the DB).
+parameter_overrides = "VpcId=vpc-REPLACE_ME DbSubnetId1=subnet-REPLACE_ME DbSubnetId2=subnet-REPLACE_ME DbAllocatedStorage=40 DbMaxAllocatedStorage=100"

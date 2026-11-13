@@ -1,0 +1,386 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Catches Amazon Inspector SBOM export objects landing in S3 (from the
+  local and remote-region export buckets) and uploads them to
+  Dependency-Track, tagged with resource metadata for cross-cutting
+  queries. Reuses dependency-track-syft-scanner's VPC/SG wiring and DT
+  API key secret via cross-stack imports. Deployed once, in the home
+  region (same region as Dependency-Track), for VPC access to the
+  apiserver; remote-region bucket events reach it via cross-region
+  EventBridge forwarding.
+
+Parameters:
+  DbStackName:
+    Type: String
+    Default: dependency-track-db
+    Description: >-
+      Stack name of dependency-track-db, used for Fn::ImportValue to
+      reuse its VPC/workload-subnet/workload-security-group exports.
+
+  SyftScannerStackName:
+    Type: String
+    Default: dependency-track-syft-scanner
+    Description: >-
+      Stack name of dependency-track-syft-scanner, used for
+      Fn::ImportValue to reuse its DtApiKeySecretArn export rather
+      than duplicating that secret.
+
+  ApiserverBaseUrl:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /dependency-track/apiserver-base-url
+    Description: >-
+      SSM parameter holding the in-VPC apiserver URL, written by
+      dependency-track-workload. Resolved at deploy time: redeploy this
+      stack if the workload instance is replaced.
+
+  ApiserverPort:
+    Type: Number
+    Default: 8081
+    Description: >-
+      Apiserver's host port on the workload EC2 instance. Used for the
+      security group rule, independent of ApiserverBaseUrl.
+
+  CatcherMemorySizeMb:
+    Type: Number
+    Default: 512
+
+  CatcherTimeoutSeconds:
+    Type: Number
+    Default: 60
+
+  RemoteSbomBucketArn:
+    Type: String
+    Description: >-
+      ARN of the remote-region Inspector SBOM export bucket. Copy from
+      that region's dependency-track-inspector-sbom stack's
+      SbomBucketArn output (cannot Fn::ImportValue cross-region).
+
+  RemoteSbomKmsKeyArn:
+    Type: String
+    Description: >-
+      ARN of the remote-region Inspector SBOM export KMS key. Copy from
+      that region's dependency-track-inspector-sbom stack's
+      SbomKmsKeyArn output (cannot Fn::ImportValue cross-region).
+
+  LocalExportStackName:
+    Type: String
+    Default: dependency-track-inspector-sbom
+    Description: >-
+      Stack name of the Inspector SBOM export stack in this (home)
+      region. Its bucket/key ARNs are imported via Fn::ImportValue.
+
+Resources:
+  # ---------------------------------------------------------------------
+  # Networking -- same pattern as dependency-track-syft-scanner's
+  # UploaderSecurityGroup: egress-only (Lambda ENIs need no inbound),
+  # ingress added to the *existing* workload SG by reference.
+  # ---------------------------------------------------------------------
+
+  CatcherSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        Inspector SBOM catcher Lambda. No ingress. Egress: HTTPS for
+        Secrets Manager/S3/cross-region KMS, plus the apiserver port
+        to the workload SG.
+      VpcId: !ImportValue
+        Fn::Sub: "${DbStackName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for Secrets Manager, S3, and KMS
+        - IpProtocol: tcp
+          FromPort: !Ref ApiserverPort
+          ToPort: !Ref ApiserverPort
+          DestinationSecurityGroupId: !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSecurityGroupId"
+          Description: Dependency-Track BOM upload
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom-catcher
+        - Key: Name
+          Value: dependency-track-inspector-sbom-catcher-sg
+
+  WorkloadIngressFromCatcher:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: "${DbStackName}-WorkloadSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: !Ref ApiserverPort
+      ToPort: !Ref ApiserverPort
+      SourceSecurityGroupId: !GetAtt CatcherSecurityGroup.GroupId
+      Description: Inspector SBOM catcher Lambda to apiserver BOM upload
+
+  # ---------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------
+
+  CatcherFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: catcher-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "${RemoteSbomBucketArn}/*"
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "${LocalExportStackName}-SbomBucketArn"
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource:
+                  - !Ref RemoteSbomKmsKeyArn
+                  - !ImportValue
+                    Fn::Sub: "${LocalExportStackName}-SbomKmsKeyArn"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue
+                  Fn::Sub: "${SyftScannerStackName}-DtApiKeySecretArn"
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom-catcher
+
+  CatcherStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-catcher
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CatcherFunction.Arn
+        - PolicyName: logging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom-catcher
+
+  EventBridgeInvokeCatcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-catcher-execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CatcherStateMachine
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom-catcher
+
+  # ---------------------------------------------------------------------
+  # Log groups
+  # ---------------------------------------------------------------------
+
+  CatcherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/dependency-track-inspector-sbom-catcher
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom-catcher
+
+  CatcherStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /stepfunctions/dependency-track-inspector-sbom-catcher
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom-catcher
+
+  # ---------------------------------------------------------------------
+  # Lambda
+  # ---------------------------------------------------------------------
+
+  CatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dependency-track-inspector-sbom-catcher
+      PackageType: Image
+      Role: !GetAtt CatcherFunctionRole.Arn
+      MemorySize: !Ref CatcherMemorySizeMb
+      Timeout: !Ref CatcherTimeoutSeconds
+      # Caps concurrent invocations to reduce simultaneous
+      # /api/v1/bom project-creation requests against DT -- an
+      # unfiltered org-wide export can produce 400-1700+ near-
+      # simultaneous S3 events, each triggering its own catcher
+      # execution. Uncapped, this produced a real HTTP 409 "already
+      # exists" failure rate against DT for projects that, on
+      # inspection, don't actually exist in DT afterward (root
+      # mechanism unconfirmed -- suspected DT-side contention under
+      # concurrent autoCreate, not confirmed to be duplicate-key
+      # races specifically). Capping concurrency eliminates the 409s
+      # but trades them for Lambda.TooManyRequestsException-driven
+      # retry exhaustion at low cap values -- both failure modes are
+      # burst-size-dependent, not a single fixed threshold: 10 fully
+      # solved a ~406-invocation Lambda burst but not a ~1722-
+      # invocation ECR burst (409s reappeared, plus retry exhaustion).
+      # 15 was the value that finally cleared both: 1720/1722 (ECR)
+      # and 409/409 (Lambda) succeeded, zero 409s in either. Extra
+      # invocations beyond this cap get
+      # Lambda.TooManyRequestsException, already handled by
+      # CatcherStateMachine's existing Retry block (MaxAttempts: 3 --
+      # confirmed this cannot be made dynamic/JSONata-driven; Step
+      # Functions Retry fields require literal integers). Revisit if
+      # export bursts grow well beyond what was tested.
+      ReservedConcurrentExecutions: 15
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref CatcherSecurityGroup
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSubnet1Id"
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSubnet2Id"
+      Environment:
+        Variables:
+          DT_API_KEY_SECRET_ARN: !ImportValue
+            Fn::Sub: "${SyftScannerStackName}-DtApiKeySecretArn"
+          APISERVER_BASE_URL: !Ref ApiserverBaseUrl
+      Tags:
+        Project: dependency-track-inspector-sbom-catcher
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./catcher
+      DockerTag: latest
+
+  # ---------------------------------------------------------------------
+  # Step Functions -- thin Express wrapper around the Lambda, purely
+  # for Retry/Catch and CloudWatch execution history visibility, same
+  # rationale as ScanAndUploadStateMachine in dependency-track-syft-scanner.
+  # ---------------------------------------------------------------------
+
+  CatcherStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: dependency-track-inspector-sbom-catcher
+      Type: EXPRESS
+      Role: !GetAtt CatcherStateMachineRole.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CatcherStateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        CatcherFunctionArn: !GetAtt CatcherFunction.Arn
+      Definition:
+        Comment: >-
+          Invokes the catcher Lambda with the raw EventBridge S3
+          ObjectCreated event as input. The Lambda itself does all the
+          work (read object, parse SBOM metadata, derive project
+          identity, upload to Dependency-Track) -- this wrapper exists
+          for Retry/Catch and execution-history visibility only.
+        QueryLanguage: JSONata
+        StartAt: InvokeCatcher
+        States:
+          InvokeCatcher:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${CatcherFunctionArn}"
+              Payload: "{% $states.input %}"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            End: true
+      Tags:
+        Project: dependency-track-inspector-sbom-catcher
+
+  # ---------------------------------------------------------------------
+  # EventBridge -- matches S3 ObjectCreated events for either SBOM
+  # bucket. Local-region events arrive on this account's default bus
+  # natively once the local bucket's EventBridge notifications are
+  # enabled (done in the local export stack). Remote-region events land
+  # on this same default bus, forwarded by the remote export stack's
+  # CrossRegionForwardRule.
+  # ---------------------------------------------------------------------
+
+  SbomObjectCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: dependency-track-inspector-sbom-catcher-trigger
+      Description: >-
+        Matches S3 ObjectCreated events from either Inspector SBOM
+        export bucket (remote-region events arrive here via cross-region
+        forwarding) and triggers the catcher state machine.
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Select [5, !Split [":", !Ref RemoteSbomBucketArn]]
+              - !ImportValue
+                Fn::Sub: "${LocalExportStackName}-SbomBucketName"
+      Targets:
+        - Arn: !Ref CatcherStateMachine
+          Id: CatcherStateMachineTarget
+          RoleArn: !GetAtt EventBridgeInvokeCatcherRole.Arn
+
+Outputs:
+  CatcherFunctionArn:
+    Value: !GetAtt CatcherFunction.Arn
+
+  CatcherStateMachineArn:
+    Value: !Ref CatcherStateMachine

@@ -1,0 +1,22 @@
+# Copy to samconfig.toml (gitignored). One profile per Inspector region.
+#   home:   sam deploy
+#   remote: sam deploy --config-env remote
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "dependency-track-inspector-sbom"
+region = "us-east-1"
+capabilities = "CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "SbomBucketName=REPLACE_ME-inspector-sboms-use1 DeployCrossRegionForward=false"
+
+[remote.deploy.parameters]
+stack_name = "dependency-track-inspector-sbom"
+region = "us-east-2"
+capabilities = "CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "SbomBucketName=REPLACE_ME-inspector-sboms-use2 DeployCrossRegionForward=true CatcherEventBusArn=arn:aws:events:us-east-1:111122223333:event-bus/default"

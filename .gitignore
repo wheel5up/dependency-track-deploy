@@ -1,0 +1,16 @@
+# AWS SAM build artifacts
+.aws-sam/
+
+# Temporary AWS credentials — never commit
+temp_key/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Deployment config (copy from samconfig.example.toml)
+samconfig.toml
+
+# Local agent state
+.claude/
+opencode-session.json

@@ -1,0 +1,14 @@
+# Copy to samconfig.toml (gitignored). Deploy in the home region only.
+# Remote* values come from the remote region's dependency-track-inspector-sbom
+# stack outputs.
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "dependency-track-inspector-sbom-catcher"
+region = "us-east-1"
+capabilities = "CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+resolve_image_repos = true
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "DbStackName=dependency-track-db SyftScannerStackName=dependency-track-syft-scanner LocalExportStackName=dependency-track-inspector-sbom RemoteSbomBucketArn=arn:aws:s3:::REPLACE_ME RemoteSbomKmsKeyArn=arn:aws:kms:us-east-2:111122223333:key/REPLACE_ME"

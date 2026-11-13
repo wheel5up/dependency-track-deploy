@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Scheduled triggers for Dependency-Track pipelines: daily EventBridge
+  rules kicking off dependency-track-syft-scanner's
+  BatchScanStateMachine (up to two GitHub orgs, unbounded), plus
+  per-region Inspector SBOM export schedules for EC2, Lambda, and ECR.
+  Deployed once per Inspector region. Batch-scan rules are created only
+  in the home region (DeployBatchScanRules), where the syft scanner
+  runs.
+
+Parameters:
+  SyftScannerStackName:
+    Type: String
+    Default: dependency-track-syft-scanner
+    Description: >-
+      Stack name of dependency-track-syft-scanner, used for
+      Fn::ImportValue to target its BatchScanStateMachine. Only used
+      when DeployBatchScanRules is true.
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 6 * * ? *)"
+    Description: >-
+      Shared schedule for both org triggers (same time, per current
+      design decision -- MaxConcurrency=1 pacing inside each batch-scan
+      execution already bounds load; no staggering needed). Default is
+      06:00 UTC daily. Both rules use this same expression.
+
+  DeployBatchScanRules:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Whether to create the GitHub batch-scan rules in this
+      deployment. Set to "false" outside the home region:
+      dependency-track-syft-scanner is deployed only there, and
+      Fn::ImportValue can't cross regions.
+
+  BatchScanOrg1:
+    Type: String
+    Default: ""
+    Description: >-
+      GitHub org for the first daily batch-scan rule. Required when
+      DeployBatchScanRules is true.
+
+  BatchScanOrg2:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional second GitHub org for a second daily batch-scan rule.
+      Leave blank to skip.
+
+  InspectorSbomStackName:
+    Type: String
+    Default: dependency-track-inspector-sbom
+    Description: >-
+      Stack name of dependency-track-inspector-sbom *in this same
+      region*. Used for Fn::ImportValue
+      to target that stack's StateMachineArn (same-region import only
+      -- Fn::ImportValue cannot cross regions, same constraint as
+      other cross-stack imports throughout this repo).
+
+  Ec2ScheduleExpression:
+    Type: String
+    Default: "cron(0 6 * * ? *)"
+    Description: >-
+      Schedule for the EC2-filtered Inspector SBOM export rule in this
+      region. Default 06:00 UTC daily -- same time as the batch-scan
+      rules is fine since they target entirely different state
+      machines/pipelines.
+
+  LambdaScheduleExpression:
+    Type: String
+    Default: "cron(30 6 * * ? *)"
+    Description: >-
+      Schedule for the Lambda-filtered Inspector SBOM export rule in
+      this region. Default 06:30 UTC daily -- deliberately 30 minutes
+      after Ec2ScheduleExpression, per explicit design decision to
+      avoid both filtered exports landing on the catcher
+      simultaneously (each already produces a large invocation burst
+      on its own).
+
+  EcrScheduleExpression:
+    Type: String
+    Default: "cron(0 7 * * ? *)"
+    Description: >-
+      Schedule for the ECR-filtered Inspector SBOM export rule in this
+      region. Default 07:00 UTC daily -- 30 minutes after
+      LambdaScheduleExpression, same staggering rationale. ECR is the
+      largest-burst resource type tested so far (~1722 invocations
+      org-wide vs. Lambda's ~409) -- confirmed this catcher
+      concurrency (15) clears that burst size with only 2/1722
+      failures, but keeping ECR isolated from the other two rules'
+      bursts rather than compounding them further.
+
+Conditions:
+  ShouldDeployBatchScanRules: !Equals [!Ref DeployBatchScanRules, "true"]
+  ShouldDeployBatchScanOrg2: !And
+    - !Condition ShouldDeployBatchScanRules
+    - !Not [!Equals [!Ref BatchScanOrg2, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------
+
+  EventBridgeStartBatchScanRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldDeployBatchScanRules
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-batch-scan-execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !ImportValue
+                  Fn::Sub: "${SyftScannerStackName}-BatchScanStateMachineArn"
+      Tags:
+        - Key: Project
+          Value: dependency-track-schedules
+
+  EventBridgeStartInspectorExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-inspector-sbom-export
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !ImportValue
+                  Fn::Sub: "${InspectorSbomStackName}-StateMachineArn"
+      Tags:
+        - Key: Project
+          Value: dependency-track-schedules
+
+  # ---------------------------------------------------------------------
+  # EventBridge -- one rule per org. Each targets
+  # dependency-track-syft-scanner's BatchScanStateMachine (Express)
+  # with a fixed Input, same as a manual
+  # `aws stepfunctions start-execution --input '{"org": "..."}'` call.
+  # No "limit" field in the input -- unbounded, full org re-scanned on
+  # every run, per current design decision. Exclude list is sourced
+  # from SSM inside that state machine itself (see
+  # dependency-track-syft-scanner's README) -- nothing to configure
+  # here.
+  # ---------------------------------------------------------------------
+
+  BatchScanOrg1DailyRule:
+    Type: AWS::Events::Rule
+    Condition: ShouldDeployBatchScanRules
+    Properties:
+      Name: !Sub "dependency-track-batch-scan-${BatchScanOrg1}-daily"
+      Description: !Sub >-
+        Daily unbounded batch-scan of ${BatchScanOrg1} repos via
+        dependency-track-syft-scanner's BatchScanStateMachine.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !ImportValue
+            Fn::Sub: "${SyftScannerStackName}-BatchScanStateMachineArn"
+          Id: BatchScanOrg1Target
+          RoleArn: !GetAtt EventBridgeStartBatchScanRole.Arn
+          Input: !Sub '{"org": "${BatchScanOrg1}"}'
+
+  BatchScanOrg2DailyRule:
+    Type: AWS::Events::Rule
+    Condition: ShouldDeployBatchScanOrg2
+    Properties:
+      Name: !Sub "dependency-track-batch-scan-${BatchScanOrg2}-daily"
+      Description: !Sub >-
+        Daily unbounded batch-scan of ${BatchScanOrg2} repos via
+        dependency-track-syft-scanner's BatchScanStateMachine.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !ImportValue
+            Fn::Sub: "${SyftScannerStackName}-BatchScanStateMachineArn"
+          Id: BatchScanOrg2Target
+          RoleArn: !GetAtt EventBridgeStartBatchScanRole.Arn
+          Input: !Sub '{"org": "${BatchScanOrg2}"}'
+
+  # ---------------------------------------------------------------------
+  # EventBridge -- Amazon Inspector SBOM export schedules, one rule per
+  # resource type, targeting dependency-track-inspector-sbom's
+  # InspectorSbomExportStateMachine *in this same region* via
+  # Fn::ImportValue on InspectorSbomStackName. Deployed once per
+  # Inspector region -- each region's deployment only ever targets its own region's
+  # state machine; there is no cross-region rule->state-machine
+  # targeting here (EventBridge scheduled rules can't invoke a
+  # different region's resources directly).
+  #
+  # EC2/Lambda/ECR each scheduled 30 minutes apart (06:00/06:30/07:00
+  # UTC by default), not at the same time -- deliberate, unlike the
+  # two batch-scan rules above. Each filtered export can independently
+  # produce a large burst of catcher invocations (up to ~1722
+  # observed for an org-wide, unfiltered-account ECR export in
+  # testing) hitting the same single catcher Lambda/DT apiserver;
+  # running them simultaneously would compound those bursts rather
+  # than the batch-scan rules' case, where MaxConcurrency=1 already
+  # bounds each org's own load independently.
+  # ---------------------------------------------------------------------
+
+  Ec2DailyInspectorExportRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: dependency-track-inspector-sbom-export-ec2-daily
+      Description: >-
+        Daily Amazon Inspector SBOM export filtered to
+        AWS_EC2_INSTANCE (all accounts, no accountId filter -- this
+        account is an Inspector delegated administrator, so this
+        covers every member account's EC2 fleet in this region), via
+        dependency-track-inspector-sbom's InspectorSbomExportStateMachine
+        in this same region.
+      ScheduleExpression: !Ref Ec2ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !ImportValue
+            Fn::Sub: "${InspectorSbomStackName}-StateMachineArn"
+          Id: InspectorExportEc2Target
+          RoleArn: !GetAtt EventBridgeStartInspectorExportRole.Arn
+          Input: '{"resourceType": "AWS_EC2_INSTANCE"}'
+
+  LambdaDailyInspectorExportRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: dependency-track-inspector-sbom-export-lambda-daily
+      Description: >-
+        Daily Amazon Inspector SBOM export filtered to
+        AWS_LAMBDA_FUNCTION (all accounts, no accountId filter -- same
+        org-wide scope as the EC2 rule above), via
+        dependency-track-inspector-sbom's InspectorSbomExportStateMachine
+        in this same region. Scheduled 30 minutes after
+        Ec2DailyInspectorExportRule by default -- see this template's
+        top-of-file comment and LambdaScheduleExpression's description
+        for why.
+      ScheduleExpression: !Ref LambdaScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !ImportValue
+            Fn::Sub: "${InspectorSbomStackName}-StateMachineArn"
+          Id: InspectorExportLambdaTarget
+          RoleArn: !GetAtt EventBridgeStartInspectorExportRole.Arn
+          Input: '{"resourceType": "AWS_LAMBDA_FUNCTION"}'
+
+  EcrDailyInspectorExportRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: dependency-track-inspector-sbom-export-ecr-daily
+      Description: >-
+        Daily Amazon Inspector SBOM export filtered to
+        AWS_ECR_CONTAINER_IMAGE (all accounts, no accountId filter --
+        same org-wide scope as the EC2/Lambda rules above), via
+        dependency-track-inspector-sbom's InspectorSbomExportStateMachine
+        in this same region. Scheduled 30 min after the Lambda rule --
+        see this template's comments for why.
+      ScheduleExpression: !Ref EcrScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !ImportValue
+            Fn::Sub: "${InspectorSbomStackName}-StateMachineArn"
+          Id: InspectorExportEcrTarget
+          RoleArn: !GetAtt EventBridgeStartInspectorExportRole.Arn
+          Input: '{"resourceType": "AWS_ECR_CONTAINER_IMAGE"}'
+
+Outputs:
+  BatchScanOrg1RuleArn:
+    Condition: ShouldDeployBatchScanRules
+    Value: !GetAtt BatchScanOrg1DailyRule.Arn
+
+  BatchScanOrg2RuleArn:
+    Condition: ShouldDeployBatchScanOrg2
+    Value: !GetAtt BatchScanOrg2DailyRule.Arn
+
+  Ec2DailyInspectorExportRuleArn:
+    Value: !GetAtt Ec2DailyInspectorExportRule.Arn
+
+  LambdaDailyInspectorExportRuleArn:
+    Value: !GetAtt LambdaDailyInspectorExportRule.Arn
+
+  EcrDailyInspectorExportRuleArn:
+    Value: !GetAtt EcrDailyInspectorExportRule.Arn

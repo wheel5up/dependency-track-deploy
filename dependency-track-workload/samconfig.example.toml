@@ -1,0 +1,15 @@
+# Copy to samconfig.toml (gitignored) and fill in the placeholders.
+# Pass CloudflareTunnelToken on the command line, not here:
+#   sam deploy --parameter-overrides CloudflareTunnelToken=...
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "dependency-track-workload"
+region = "us-east-1"
+capabilities = "CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+confirm_changeset = true
+fail_on_empty_changeset = false
+# WorkloadAmiId: aws ssm get-parameter --name /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+# WorkloadSubnetId is optional (defaults to the db stack's first subnet).
+parameter_overrides = "DbStackName=dependency-track-db PublicApiBaseUrl=https://dtrack-api.example.com WorkloadAmiId=ami-REPLACE_ME OidcEnabled=true OidcIssuer=https://example.okta.com/oauth2/REPLACE_ME OidcClientId=REPLACE_ME"

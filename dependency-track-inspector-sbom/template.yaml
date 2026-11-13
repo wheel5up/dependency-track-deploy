@@ -1,0 +1,390 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Amazon Inspector SBOM export pipeline for one region: S3 bucket +
+  KMS key, plus an Express state machine calling
+  inspector2:CreateSbomExport directly (AWS SDK integration, no
+  Lambda). Fire-and-forget; Inspector writes SBOMs to this bucket
+  asynchronously. Deploy once per region, since Inspector requires the
+  bucket/key in the same region as the export. In the home region
+  (where Dependency-Track and the catcher run) bucket events reach the
+  catcher natively; in remote regions they are forwarded cross-region
+  to the home region's default bus.
+
+Parameters:
+  SbomBucketName:
+    Type: String
+    Description: >-
+      S3 bucket Inspector writes SBOM exports to in this region.
+
+  SbomKmsKeyAliasName:
+    Type: String
+    Default: alias/inspector-sbom-export
+    Description: KMS alias for the SBOM export key (regional, so the same name works in every region).
+
+  CatcherEventBusArn:
+    Type: String
+    Default: unused
+    Description: >-
+      ARN of the home region's default EventBridge event bus, where
+      this bucket's ObjectCreated events are forwarded so the
+      dependency-track-inspector-sbom-catcher stack's rule (defined
+      there, not here) can pick them up. Typically
+      arn:aws:events:<home-region>:<account-id>:event-bus/default. Only
+      used when DeployCrossRegionForward is true -- leave as the
+      "unused" default in the home region.
+
+  DeployCrossRegionForward:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Whether to create the cross-region forwarding rule
+      (ForwardToHomeRule) below. Set to "false" in the home region --
+      its bucket events already land natively on the home default bus,
+      so forwarding them would duplicate every catcher trigger. Leave
+      "true" in remote regions.
+
+Conditions:
+  ShouldForwardCrossRegion: !Equals [!Ref DeployCrossRegionForward, "true"]
+
+Resources:
+  # ---------------------------------------------------------------------
+  # KMS -- customer-managed symmetric key, same region as the bucket
+  # below (Inspector's own requirement). Root account retains full
+  # admin access via the default statement; the allow-inspector
+  # statement is scoped to only this account's own SBOM export report
+  # ARNs, following the same idiom AWS documents for findings-report
+  # export KMS policies.
+  # ---------------------------------------------------------------------
+
+  SbomKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "Amazon Inspector SBOM export encryption key (${AWS::Region})"
+      KeyUsage: ENCRYPT_DECRYPT
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: allow-inspector
+            Effect: Allow
+            Principal:
+              Service: inspector2.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:inspector2:${AWS::Region}:${AWS::AccountId}:report/*"
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom
+
+  SbomKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Ref SbomKmsKeyAliasName
+      TargetKeyId: !Ref SbomKmsKey
+
+  # ---------------------------------------------------------------------
+  # S3 -- bucket policy statement matches AWS's own documented
+  # "Configure export permissions" example exactly (see repo session
+  # notes for the verification against current docs). EventBridge
+  # notifications enabled so ObjectCreated events reach the forwarding
+  # rule below without needing S3 event notification -> SNS/SQS
+  # plumbing.
+  # ---------------------------------------------------------------------
+
+  SbomBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SbomBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SbomKmsKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom
+
+  SbomBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SbomBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: allow-inspector
+            Effect: Allow
+            Principal:
+              Service: inspector2.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:AbortMultipartUpload
+            Resource: !Sub "${SbomBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:inspector2:${AWS::Region}:${AWS::AccountId}:report/*"
+
+  # ---------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------
+
+  InspectorSbomExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # No explicit RoleName -- IAM roles are account-global (not
+      # regional), and this same template is deployed independently
+      # per-region (see samconfig.toml's useast2 profile) since
+      # Inspector requires a same-region S3 bucket/KMS key per export.
+      # An explicit name here would collide across those stacks; let
+      # CloudFormation auto-generate a stack-qualified name instead.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: create-sbom-export
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: inspector2:CreateSbomExport
+                Resource: "*"
+        - PolicyName: logging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Required by Step Functions for CloudWatch Logs
+              # delivery -- these exact actions are AWS-documented for
+              # state machine logging and don't support resource-level
+              # scoping, same idiom already used in
+              # dependency-track-syft-scanner's state machine roles.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom
+
+  EventBridgeForwardToHomeRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldForwardCrossRegion
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: put-events-to-home-bus
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref CatcherEventBusArn
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom
+
+  # ---------------------------------------------------------------------
+  # Log group (Express state machines require execution logging)
+  # ---------------------------------------------------------------------
+
+  InspectorSbomExportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /stepfunctions/dependency-track-inspector-sbom-export
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dependency-track-inspector-sbom
+
+  # ---------------------------------------------------------------------
+  # EventBridge -- forwards this bucket's ObjectCreated events to the
+  # home region's default event bus, where the catcher stack's own rule
+  # (defined in dependency-track-inspector-sbom-catcher, not here)
+  # matches them the same way it matches home-region bucket events.
+  # ---------------------------------------------------------------------
+
+  ForwardToHomeRule:
+    Type: AWS::Events::Rule
+    Condition: ShouldForwardCrossRegion
+    Properties:
+      Name: dependency-track-inspector-sbom-forward-to-home
+      Description: >-
+        Forwards this bucket's S3 ObjectCreated events to the home
+        region's default event bus, for pickup by the
+        dependency-track-inspector-sbom-catcher stack's rule there.
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref SbomBucket
+      Targets:
+        - Arn: !Ref CatcherEventBusArn
+          Id: ForwardToHomeDefaultBus
+          RoleArn: !GetAtt EventBridgeForwardToHomeRole.Arn
+
+  # ---------------------------------------------------------------------
+  # Step Functions
+  # ---------------------------------------------------------------------
+
+  # InspectorSbomExportStateMachine: one Task state, direct AWS SDK
+  # integration (arn:aws:states:::aws-sdk:inspector2:createSbomExport),
+  # no Lambda. Fire-and-forget -- Inspector performs the actual export
+  # asynchronously and writes results to S3 on its own; this execution
+  # only needs to succeed in *starting* the export (returns a
+  # reportId), matching the design decision made earlier not to poll
+  # inspector2:GetSbomExport in-line.
+  #
+  # Execution input (all fields optional -- omit any of them to not
+  # filter on that dimension; omit both entirely for an unfiltered,
+  # account/org-wide export):
+  #   {
+  #     "resourceType": "AWS_EC2_INSTANCE",
+  #     "accountId": "111122223333"
+  #   }
+  # resourceType valid values (per Inspector's own resourceType
+  # property on exported resources): AWS_EC2_INSTANCE,
+  # AWS_ECR_CONTAINER_IMAGE, AWS_LAMBDA_FUNCTION.
+  #
+  # Additional resourceFilterCriteria fields (ecrRepositoryName,
+  # lambdaFunctionName, resourceId, ecrImageTags, ec2InstanceTags,
+  # lambdaFunctionTags) are not wired up yet -- add them the same way
+  # once ECR/Lambda filtering is tested, per the EC2-first rollout
+  # plan.
+  #
+  # Filter semantics (per the Inspector API reference): conditions
+  # within the same field are OR'd; conditions across different fields
+  # are AND'd. So resourceType=AWS_EC2_INSTANCE + accountId=X means
+  # "EC2 instances AND in this account", not "either/or".
+  InspectorSbomExportStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: dependency-track-inspector-sbom-export
+      Type: EXPRESS
+      Role: !GetAtt InspectorSbomExportRole.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt InspectorSbomExportLogGroup.Arn
+      DefinitionSubstitutions:
+        SbomBucketName: !Ref SbomBucket
+        SbomKmsKeyArn: !GetAtt SbomKmsKey.Arn
+      Definition:
+        Comment: >-
+          Calls inspector2:CreateSbomExport directly (no Lambda),
+          optionally scoped by resourceType/accountId from execution
+          input. Fire-and-forget -- does not wait for the export to
+          complete; Inspector writes SBOMs to S3 asynchronously.
+        QueryLanguage: JSONata
+        StartAt: CreateSbomExport
+        States:
+          CreateSbomExport:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:inspector2:createSbomExport
+            Comment: >-
+              ResourceFilterCriteria is built inline from execution
+              input -- $merge drops any dimension whose input field
+              was omitted, and the whole key is omitted from the
+              request entirely (not sent as null) when neither
+              resourceType nor accountId was provided, since a missing
+              key vs. an explicit null are not treated the same by the
+              underlying Inspector API.
+            Arguments: |-
+              {%
+                (
+                  $criteria := $merge([
+                    $exists($states.input.resourceType) ? {
+                      "ResourceType": [{"Comparison": "EQUALS", "Value": $states.input.resourceType}]
+                    } : {},
+                    $exists($states.input.accountId) ? {
+                      "AccountId": [{"Comparison": "EQUALS", "Value": $states.input.accountId}]
+                    } : {}
+                  ]);
+                  $merge([
+                    {
+                      "ReportFormat": "CYCLONEDX_1_4",
+                      "S3Destination": {
+                        "BucketName": "${SbomBucketName}",
+                        "KmsKeyArn": "${SbomKmsKeyArn}"
+                      }
+                    },
+                    $count($keys($criteria)) > 0 ? {"ResourceFilterCriteria": $criteria} : {}
+                  ])
+                )
+              %}
+            Retry:
+              - ErrorEquals:
+                  - Inspector2.ThrottlingException
+                  - Inspector2.InternalServerException
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            End: true
+      Tags:
+        Project: dependency-track-inspector-sbom
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref InspectorSbomExportStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-StateMachineArn"
+
+  SbomBucketName:
+    Value: !Ref SbomBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-SbomBucketName"
+
+  SbomBucketArn:
+    Value: !GetAtt SbomBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SbomBucketArn"
+
+  SbomKmsKeyArn:
+    Value: !GetAtt SbomKmsKey.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SbomKmsKeyArn"

@@ -1,0 +1,920 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Syft SBOM scanner: a Step Functions state machine chaining two
+  container-image Lambdas. "scan" downloads a GitHub repo tarball, runs
+  syft, and writes the CycloneDX SBOM to S3, returning only an S3
+  pointer to the state machine. "upload" reads that object directly
+  from S3 and POSTs it to the Dependency-Track apiserver's BOM upload
+  API. Splitting the work this way keeps the SBOM bytes out of the
+  state machine's own JSON data, which Step Functions caps at 256 KB
+  per state -- a real SBOM routinely exceeds that. Only the upload
+  Lambda needs to reach the apiserver, so only it runs inside the
+  InfoSec VPC; the scan Lambda stays outside it (needs internet egress
+  to GitHub, not the private network). Nothing in the
+  dependency-track-db or dependency-track-workload stacks is modified;
+  this stack only imports the workload security group (to add an
+  ingress rule) and the workload subnet IDs.
+
+Parameters:
+  DbStackName:
+    Type: String
+    Default: dependency-track-db
+    Description: Stack name of the dependency-track-db stack, used for Fn::ImportValue.
+
+  ApiserverBaseUrl:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /dependency-track/apiserver-base-url
+    Description: >-
+      SSM parameter holding the in-VPC apiserver URL, written by
+      dependency-track-workload. Resolved at deploy time: redeploy this
+      stack if the workload instance is replaced.
+
+  ApiserverPort:
+    Type: Number
+    Default: 8081
+    Description: >-
+      Apiserver's host port on the workload EC2 instance (bridge-mode
+      HostPort from dependency-track-workload's Task Definition). Used
+      for the security group rule, independent of ApiserverBaseUrl.
+
+  SyftVersion:
+    Type: String
+    Default: v1.18.0
+    Description: >-
+      Syft release tag to install in the scan image. Pinned rather than
+      "latest" for reproducible builds -- see
+      https://github.com/anchore/syft/releases.
+
+  EphemeralStorageSizeMb:
+    Type: Number
+    Default: 2048
+    Description: >-
+      /tmp size for the scan function. Sized for repeated warm
+      invocations of moderately large repos, not just a single cold run.
+
+  ScanMemorySizeMb:
+    Type: Number
+    Default: 2048
+
+  ScanTimeoutSeconds:
+    Type: Number
+    Default: 300
+
+  UploadMemorySizeMb:
+    Type: Number
+    Default: 512
+
+  UploadTimeoutSeconds:
+    Type: Number
+    Default: 60
+
+  ListReposPageMemorySizeMb:
+    Type: Number
+    Default: 512
+
+  ListReposPageTimeoutSeconds:
+    Type: Number
+    Default: 60
+
+  BatchScanInterRepoDelaySeconds:
+    Type: Number
+    Default: 1
+    Description: >-
+      Default value for the /dependency-track/batch-scan/inter-repo-delay-seconds
+      SSM parameter -- seconds to wait between each repo's scan kickoff
+      within a page (MapRepos runs at MaxConcurrency 1, so this paces
+      startExecution calls against the scanner state machine strictly
+      one at a time). Adjustable post-deploy via
+      `aws ssm put-parameter --overwrite` without a redeploy.
+
+  BatchScanExcludeRepos:
+    Type: String
+    Default: "[]"
+    Description: >-
+      Default value for the /dependency-track/batch-scan/exclude-repos
+      SSM parameter -- a JSON array string of "owner/repo" full names to
+      skip (e.g. known-empty repos that 404 on tarball download).
+      Defaults to an empty array. Adjustable post-deploy via
+      `aws ssm put-parameter --overwrite` without a redeploy -- picked
+      up on the very next execution or recursive page, same as the
+      inter-repo delay above.
+
+Resources:
+  # ---------------------------------------------------------------------
+  # S3 (SBOM artifacts)
+  # ---------------------------------------------------------------------
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # Secrets -- both are empty placeholders at stack creation, same
+  # idiom as CloudflareTunnelTokenSecret in the workload stack: fill in
+  # via the AWS Console/CLI post-deploy (see README).
+  # ---------------------------------------------------------------------
+
+  GithubAppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: dependency-track/syft-github-token
+      Description: >-
+        GitHub App credentials (App ID + PEM private key) used by the
+        scan Lambda to mint short-lived per-org installation tokens for
+        downloading tarballs of private repos. No installation ID is
+        stored here -- the Lambda resolves it per request via
+        GET /orgs/{org}/installation, so installing the app into a new
+        org needs no secret or code change. Blank at stack creation;
+        fill in as {"app_id": "...", "private_key": "-----BEGIN..."}
+        post-deploy (see README).
+      SecretString: '{"app_id":"","private_key":""}'
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  DtApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: dependency-track/syft-dtrack-api-key
+      Description: >-
+        Dependency-Track API key (BOM_UPLOAD + PROJECT_CREATION_UPLOAD
+        permissions) used by the upload Lambda. Cannot be created via
+        CloudFormation -- create it in the Dependency-Track UI
+        (Administration -> Access Management) and fill this in
+        post-deploy.
+      SecretString: '{"apiKey":""}'
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # Networking -- only the upload Lambda runs in the VPC. Its security
+  # group is egress-only (Lambda ENIs need no inbound), and the one
+  # ingress rule it needs is added to the *existing* workload SG here,
+  # following the same edit-by-reference precedent already used in
+  # dependency-track-workload/template.yaml (EgressHttps/EgressPostgres
+  # are separate rule resources attached to the imported SG id).
+  # ---------------------------------------------------------------------
+
+  UploaderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        Syft scanner upload Lambda. No ingress (Lambda ENIs do not need
+        inbound). Egress: HTTPS for Secrets Manager/S3 via the
+        NAT-routed subnets, plus the apiserver port to the workload SG.
+      VpcId: !ImportValue
+        Fn::Sub: "${DbStackName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for Secrets Manager and S3
+        - IpProtocol: tcp
+          FromPort: !Ref ApiserverPort
+          ToPort: !Ref ApiserverPort
+          DestinationSecurityGroupId: !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSecurityGroupId"
+          Description: Dependency-Track BOM upload
+      Tags:
+        - Key: Project
+          Value: dependency-track
+        - Key: Name
+          Value: dependency-track-syft-scanner-uploader-sg
+
+  WorkloadIngressFromUploader:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: "${DbStackName}-WorkloadSecurityGroupId"
+      IpProtocol: tcp
+      FromPort: !Ref ApiserverPort
+      ToPort: !Ref ApiserverPort
+      SourceSecurityGroupId: !GetAtt UploaderSecurityGroup.GroupId
+      Description: Syft scanner upload Lambda to apiserver BOM upload
+
+  # User-configurable pacing knob for BatchScanStateMachine's per-repo
+  # delay -- read fresh at the start of every execution/recursive call
+  # (see getInput below), so it can be tuned via
+  # `aws ssm put-parameter --overwrite` without a redeploy.
+  BatchScanInterRepoDelaySecondsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /dependency-track/batch-scan/inter-repo-delay-seconds
+      Type: String
+      Value: !Ref BatchScanInterRepoDelaySeconds
+      Description: >-
+        Seconds to wait between each repo's scan kickoff in
+        BatchScanStateMachine's MapRepos loop (MaxConcurrency 1).
+        Adjust and the next execution/recursive page picks it up
+        immediately -- no redeploy needed.
+      Tags:
+        Project: dependency-track
+
+  # User-configurable exclude list for BatchScanStateMachine -- a JSON
+  # array string (e.g. '[]' or '["example-org/empty-repo","example-org/other-repo"]'),
+  # parsed via $parse() in the state machine (same idiom as
+  # getDependabotFindingsStepFunction parsing its own SSM JSON config).
+  # Read fresh on every execution/recursive call, same as the delay
+  # parameter above -- adjust via `aws ssm put-parameter --overwrite`
+  # and it takes effect on the next execution or recursive page, no
+  # redeploy needed. Execution input's own "exclude" (if provided)
+  # still takes precedence -- this SSM value is only used as the
+  # fallback default, mirroring how "limit"/"property"/"values" already
+  # default from execution input, not SSM.
+  BatchScanExcludeReposParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /dependency-track/batch-scan/exclude-repos
+      Type: String
+      Value: !Ref BatchScanExcludeRepos
+      Description: >-
+        JSON array string of "owner/repo" full names to exclude from
+        BatchScanStateMachine runs (e.g. known-empty repos). Defaults
+        to "[]". Adjust and the next execution/recursive page picks it
+        up immediately -- no redeploy needed.
+      Tags:
+        Project: dependency-track
+
+  # ---------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------
+
+  ScanFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: scan-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GithubAppSecret
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  UploadFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: upload-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DtApiKeySecret
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  ListReposPageFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: list-repos-page-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GithubAppSecret
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-lambdas
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ScanFunction.Arn
+                  - !GetAtt UploadFunction.Arn
+        - PolicyName: logging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Required by Step Functions for CloudWatch Logs
+              # delivery -- these are the exact actions AWS documents
+              # for state machine logging, and they don't support
+              # resource-level scoping.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # BatchScanRole: executes the batch-scan Express state machine.
+  # StartExecution scoped to two ARNs only -- itself (for the
+  # dependabot-style recursive pagination pattern) and the existing
+  # scanner state machine (fired fire-and-forget, once per repo, from
+  # inside the Map state). No :sync variants -- Express does not
+  # support them.
+  BatchScanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-list-repos-page
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ListReposPageFunction.Arn
+        - PolicyName: read-batch-scan-ssm-config
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # GetSsmConfig uses the batched aws-sdk:ssm:getParameters
+              # integration (plural), which requires ssm:GetParameters
+              # (plural) -- not ssm:GetParameter -- on each of the two
+              # parameter ARNs it requests in one call.
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${BatchScanInterRepoDelaySecondsParameter}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${BatchScanExcludeReposParameter}"
+        - PolicyName: start-executions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource:
+                  - !Ref ScanAndUploadStateMachine
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:dependency-track-batch-scan"
+        - PolicyName: logging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Required by Step Functions for CloudWatch Logs
+              # delivery -- same exact actions as StateMachineRole
+              # above; they don't support resource-level scoping.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # Log groups (explicit, with retention -- same pattern as
+  # /ecs/dependency-track in the workload stack)
+  # ---------------------------------------------------------------------
+
+  ScanLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/dependency-track-syft-scanner-scan
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  UploadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/dependency-track-syft-scanner-upload
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  ListReposPageLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/dependency-track-syft-scanner-list-repos-page
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /stepfunctions/dependency-track-syft-scanner
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # Express state machines require execution logging (unlike Standard,
+  # where it's optional) -- separate log group from the Scan/Upload
+  # Standard state machine's above.
+  BatchScanLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /stepfunctions/dependency-track-batch-scan
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # Lambda functions (container images)
+  # ---------------------------------------------------------------------
+
+  ScanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dependency-track-syft-scanner-scan
+      PackageType: Image
+      Role: !GetAtt ScanFunctionRole.Arn
+      MemorySize: !Ref ScanMemorySizeMb
+      Timeout: !Ref ScanTimeoutSeconds
+      EphemeralStorage:
+        Size: !Ref EphemeralStorageSizeMb
+      Environment:
+        Variables:
+          ARTIFACT_BUCKET: !Ref ArtifactBucket
+          GITHUB_APP_SECRET_ARN: !Ref GithubAppSecret
+      Tags:
+        Project: dependency-track
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./scanner
+      DockerTag: latest
+      DockerBuildArgs:
+        SYFT_VERSION: !Ref SyftVersion
+
+  UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dependency-track-syft-scanner-upload
+      PackageType: Image
+      Role: !GetAtt UploadFunctionRole.Arn
+      MemorySize: !Ref UploadMemorySizeMb
+      Timeout: !Ref UploadTimeoutSeconds
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref UploaderSecurityGroup
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSubnet1Id"
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSubnet2Id"
+      Environment:
+        Variables:
+          DT_API_KEY_SECRET_ARN: !Ref DtApiKeySecret
+          APISERVER_BASE_URL: !Ref ApiserverBaseUrl
+      Tags:
+        Project: dependency-track
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./uploader
+      DockerTag: latest
+
+  ListReposPageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dependency-track-syft-scanner-list-repos-page
+      PackageType: Image
+      Role: !GetAtt ListReposPageFunctionRole.Arn
+      MemorySize: !Ref ListReposPageMemorySizeMb
+      Timeout: !Ref ListReposPageTimeoutSeconds
+      Environment:
+        Variables:
+          GITHUB_APP_SECRET_ARN: !Ref GithubAppSecret
+      Tags:
+        Project: dependency-track
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./list-repos-page
+      DockerTag: latest
+
+  # ---------------------------------------------------------------------
+  # Step Functions
+  # ---------------------------------------------------------------------
+
+  ScanAndUploadStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: dependency-track-syft-scanner
+      Role: !GetAtt StateMachineRole.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        ScanFunctionArn: !GetAtt ScanFunction.Arn
+        UploadFunctionArn: !GetAtt UploadFunction.Arn
+      Definition:
+        Comment: >-
+          Scan a GitHub repo with syft and upload the resulting SBOM to
+          Dependency-Track. Input: {"repo_url", "ref"} (required),
+          optional "project_name"/"project_version". The Scan state's
+          output (an S3 pointer, not the SBOM itself) becomes the
+          entire input to Upload.
+        StartAt: Scan
+        States:
+          Scan:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: "${ScanFunctionArn}"
+              Payload.$: "$"
+            ResultSelector:
+              bucket.$: "$.Payload.bucket"
+              key.$: "$.Payload.key"
+              project_name.$: "$.Payload.project_name"
+              project_version.$: "$.Payload.project_version"
+              owner.$: "$.Payload.owner"
+              repo.$: "$.Payload.repo"
+              repo_metadata.$: "$.Payload.repo_metadata"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: "$.error"
+                Next: ScanFailed
+            Next: Upload
+          Upload:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: "${UploadFunctionArn}"
+              Payload.$: "$"
+            ResultSelector:
+              project_name.$: "$.Payload.project_name"
+              project_version.$: "$.Payload.project_version"
+              status.$: "$.Payload.status"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: "$.error"
+                Next: UploadFailed
+            End: true
+          ScanFailed:
+            Type: Fail
+            Error: ScanFailed
+            Cause: syft scan or SBOM upload to S3 failed
+          UploadFailed:
+            Type: Fail
+            Error: UploadFailed
+            Cause: Dependency-Track BOM upload failed
+      Tags:
+        Project: dependency-track
+
+  # BatchScanStateMachine: Express workflow that enumerates non-archived
+  # repos in a GitHub org (filtered by a custom property and an
+  # explicit exclude list, capped by a limit) via the GitHub Search
+  # API, and fires one fire-and-forget execution of the existing
+  # ScanAndUploadStateMachine per repo.
+  #
+  # Pagination follows the same self-recursive pattern as
+  # jira-security-automation/getDependabot (dependabot's
+  # getDependabotFindingsStepFunction): each page's Map fan-out runs
+  # inside the current execution, then -- rather than looping back to
+  # an earlier state -- the Choice state starts a brand-new execution
+  # of this same state machine for the next page and ends the current
+  # one. This resets Express's 5-minute execution cap on every page
+  # (irrelevant at current repo counts, but keeps this consistent with
+  # the established org pattern) and gives each page its own
+  # independent execution history/status in the console, at the cost
+  # of state having to round-trip through StartExecution Input/Output
+  # instead of staying in-memory across pages.
+  #
+  # Express (not Standard) per requirement -- this means:
+  #   - No Distributed Map (Standard-only) -- MapRepos below is an
+  #     ordinary inline Map.
+  #   - No `.sync`/`.sync:2` service integration patterns -- both the
+  #     recursive self-call and the per-repo scanner call use plain
+  #     (non-blocking) states:startExecution.
+  #   - Per-repo scan/upload success or failure is therefore NOT
+  #     visible from this state machine's own execution result --
+  #     only from ScanAndUploadStateMachine's own execution history/
+  #     CloudWatch logs.
+  #
+  # Execution input:
+  #   {
+  #     "org": "example-org",
+  #     "property": "tier",
+  #     "values": ["1", "2"],
+  #     "limit": 10
+  #   }
+  # "limit" is optional -- omit it entirely to scan every non-excluded,
+  # non-archived match with no cap (pagination then only stops once
+  # the Search API itself is exhausted, i.e. HasNextPage false).
+  # (limit/property/values are execution input, not standing config --
+  # see README discussion. "exclude" is deliberately NOT an execution
+  # input field -- it is sourced entirely from the
+  # /dependency-track/batch-scan/exclude-repos SSM parameter (a JSON
+  # array string, defaults to "[]"), read fresh on every execution/
+  # recursive page, so an operator can append a newly-discovered
+  # broken/empty repo mid-run via `aws ssm put-parameter --overwrite`
+  # without needing to restart the batch or thread it through
+  # execution input.)
+  BatchScanStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: dependency-track-batch-scan
+      Type: EXPRESS
+      Role: !GetAtt BatchScanRole.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt BatchScanLogGroup.Arn
+      DefinitionSubstitutions:
+        ListReposPageFunctionArn: !GetAtt ListReposPageFunction.Arn
+        ScanAndUploadStateMachineArn: !Ref ScanAndUploadStateMachine
+        # Constructed by name, not !GetAtt/!Ref -- a state machine
+        # cannot reference its own ARN via GetAtt without a circular
+        # dependency. Same idiom as getDependabotFindingsStepFunction's
+        # SelfArn substitution.
+        SelfArn: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:dependency-track-batch-scan"
+      Definition:
+        Comment: >-
+          Enumerate non-archived repos in a GitHub org (filtered by a
+          custom property, an exclude list, and a limit) via the
+          GitHub Search API, and fire one fire-and-forget
+          ScanAndUploadStateMachine execution per repo. Paginates via
+          self-recursion (starts a new execution of itself per page),
+          following the same pattern as
+          jira-security-automation/getDependabot.
+        QueryLanguage: JSONata
+        StartAt: getInput
+        States:
+          getInput:
+            Type: Pass
+            Assign:
+              Org: "{% $states.input.org %}"
+              Property: "{% $exists($states.input.property) ? $states.input.property : null %}"
+              Values: "{% $exists($states.input.values) ? $states.input.values : null %}"
+              Page: "{% $exists($states.input.page) ? $states.input.page : 1 %}"
+              LimitRemaining: "{% $exists($states.input.limit_remaining) ? $states.input.limit_remaining : ($exists($states.input.limit) ? $states.input.limit : null) %}"
+              ScannedCount: "{% $exists($states.input.scanned_count) ? $states.input.scanned_count : 0 %}"
+            Next: GetSsmConfig
+          GetSsmConfig:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameters
+            Comment: >-
+              Read fresh on every execution/recursive call (not just
+              once) so an operator's `ssm put-parameter --overwrite`
+              for either value takes effect on the very next page, not
+              just future runs. Exclude list is SSM-sourced only (not
+              execution input) -- one place to manage it, same idiom as
+              getDependabotFindingsStepFunction's getConnections state
+              batching multiple SSM reads in one call.
+            Arguments:
+              Names:
+                - /dependency-track/batch-scan/inter-repo-delay-seconds
+                - /dependency-track/batch-scan/exclude-repos
+            Assign:
+              InterRepoDelaySeconds: "{% $number($states.result.Parameters[Name = '/dependency-track/batch-scan/inter-repo-delay-seconds'].Value) %}"
+              Exclude: "{% $parse($states.result.Parameters[Name = '/dependency-track/batch-scan/exclude-repos'].Value) %}"
+            Next: FetchPage
+          FetchPage:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${ListReposPageFunctionArn}"
+              Payload:
+                org: "{% $Org %}"
+                property: "{% $Property %}"
+                values: "{% $Values %}"
+                exclude: "{% $Exclude %}"
+                page: "{% $Page %}"
+                limit_remaining: "{% $LimitRemaining %}"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 5
+                MaxAttempts: 4
+                BackoffRate: 2
+            Assign:
+              Repos: "{% $states.result.Payload.items %}"
+              HasNextPage: "{% $states.result.Payload.has_next_page %}"
+              LimitRemaining: "{% $states.result.Payload.limit_remaining %}"
+            Next: CountRepos
+          CountRepos:
+            Type: Pass
+            Assign:
+              ScannedCount: "{% $ScannedCount + $count($Repos) %}"
+            Next: MapRepos
+          MapRepos:
+            Type: Map
+            Items: "{% $Repos %}"
+            MaxConcurrency: 1
+            Comment: >-
+              MaxConcurrency 1 -- repos within a page are scanned
+              strictly one at a time (see InterRepoWait below for the
+              pacing between them), not fanned out in parallel.
+            ItemSelector:
+              repo: "{% $states.context.Map.Item.Value %}"
+              delaySeconds: "{% $InterRepoDelaySeconds %}"
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: startScan
+              States:
+                startScan:
+                  Type: Task
+                  Resource: arn:aws:states:::states:startExecution
+                  Arguments:
+                    StateMachineArn: "${ScanAndUploadStateMachineArn}"
+                    Input:
+                      repo_url: "{% $states.input.repo.repo_url %}"
+                      ref: "{% $states.input.repo.ref %}"
+                      repo_metadata: "{% $states.input.repo.repo_metadata %}"
+                  Assign:
+                    delaySeconds: "{% $states.input.delaySeconds %}"
+                  Next: InterRepoWait
+                InterRepoWait:
+                  Type: Wait
+                  Seconds: "{% $delaySeconds %}"
+                  Comment: >-
+                    User-configurable delay between each repo's scan
+                    kickoff (/dependency-track/batch-scan/inter-repo-delay-seconds),
+                    on top of MaxConcurrency 1 above.
+                  End: true
+            Next: Wait
+          Wait:
+            Type: Wait
+            Seconds: 2
+            Comment: >-
+              Holds page-fetch rate to the GitHub Search API's 30
+              req/min authenticated cap, across recursive calls.
+            Next: getMoreReposChoice
+          getMoreReposChoice:
+            Type: Choice
+            Choices:
+              - Condition: "{% $HasNextPage and ($LimitRemaining = null or $LimitRemaining > 0) %}"
+                Next: recursiveCall
+            Default: reportStats
+            Comment: See if another page is needed, or the run is done.
+          recursiveCall:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution
+            Arguments:
+              StateMachineArn: "${SelfArn}"
+              Input:
+                org: "{% $Org %}"
+                property: "{% $Property %}"
+                values: "{% $Values %}"
+                page: "{% $Page + 1 %}"
+                limit_remaining: "{% $LimitRemaining %}"
+                scanned_count: "{% $ScannedCount %}"
+            Comment: >-
+              exclude is intentionally omitted here -- the next
+              execution re-reads /dependency-track/batch-scan/exclude-repos
+              from SSM itself in GetSsmConfig, so an operator edit to
+              the list takes effect on the very next page even mid-run.
+            End: true
+          reportStats:
+            Type: Pass
+            Output:
+              org: "{% $Org %}"
+              scanned_count: "{% $ScannedCount %}"
+            End: true
+      Tags:
+        Project: dependency-track
+
+Outputs:
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+    Export:
+      # Added for dependency-track-ghcr-scanner, which writes GHCR
+      # SBOMs into this same bucket (under a ghcr-sboms/ prefix) rather
+      # than provisioning its own -- see that stack's README.md
+      # "Reusing the existing upload Lambda and artifact bucket".
+      Name: !Sub "${AWS::StackName}-ArtifactBucketName"
+
+  StateMachineArn:
+    Value: !Ref ScanAndUploadStateMachine
+
+  BatchScanStateMachineArn:
+    Value: !Ref BatchScanStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-BatchScanStateMachineArn"
+
+  UploadFunctionArn:
+    Value: !GetAtt UploadFunction.Arn
+    Export:
+      # Added for dependency-track-ghcr-scanner, which invokes this
+      # Lambda directly from its own state machine rather than
+      # duplicating it -- see that stack's README.md "Reusing the
+      # existing upload Lambda and artifact bucket". Unchanged
+      # input/output contract: {bucket, key, project_name,
+      # project_version} in, {project_name, project_version, status}
+      # out -- same shape ScanAndUploadStateMachine's own Upload state
+      # already uses above.
+      Name: !Sub "${AWS::StackName}-UploadFunctionArn"
+
+  GithubAppSecretArn:
+    Value: !Ref GithubAppSecret
+
+  DtApiKeySecretArn:
+    Value: !Ref DtApiKeySecret
+    Export:
+      Name: !Sub "${AWS::StackName}-DtApiKeySecretArn"

@@ -1,0 +1,606 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  GHCR (GitHub Container Registry) SBOM scanner. Extends
+  dependency-track-syft-scanner rather than duplicating it -- reuses
+  its UploadFunction and ArtifactBucket (prefix ghcr-sboms/). Two new
+  Lambdas: "discovery" queries Cartography's Neo4j for every distinct
+  ghcr.io image running on the Kubernetes fleet, refreshing a static
+  SSM Advanced parameter; "scan" runs syft registry: mode (no local
+  image pull) and hands off to the existing upload Lambda. Registry
+  pull auth confirmed working (classic PAT). See README.md for full
+  design notes and open questions.
+
+Parameters:
+  SyftScannerStackName:
+    Type: String
+    Default: dependency-track-syft-scanner
+    Description: >-
+      Stack name of dependency-track-syft-scanner, used for
+      Fn::ImportValue to reuse its UploadFunctionArn and
+      ArtifactBucketName exports.
+
+  DbStackName:
+    Type: String
+    Default: dependency-track-db
+    Description: >-
+      Stack name of dependency-track-db, used for Fn::ImportValue on
+      VpcId/WorkloadSubnet1Id/WorkloadSubnet2Id. Cartography's Neo4j
+      instance must be reachable from these subnets (same VPC).
+
+  # No Neo4jUriSsmParameterName CloudFormation parameter -- tried first
+  # (both as a plain String combined with Fn::Sub, and as a typed
+  # AWS::SSM::Parameter::Value<String>), REJECTED both times by
+  # CloudFormation ("parameter ... should not contain ssm versionless
+  # resolver") -- a real restriction hit during this stack's first two
+  # deploy attempts, not a hypothetical. Root cause: this template uses
+  # Transform: AWS::Serverless-2016-10-31 (SAM), and per CloudFormation's
+  # own dynamic-references docs, "If you're using transforms... 
+  # CloudFormation doesn't resolve dynamic references before applying
+  # the transform" -- nesting a CloudFormation parameter reference
+  # INSIDE a {{resolve:ssm:...}} dynamic reference doesn't survive that
+  # ordering. Fixed by hardcoding the literal SSM parameter name
+  # directly into NEO4J_URI's own {{resolve:ssm:...}} string below --
+  # no CloudFormation parameter indirection at all for this value. See README.md "Where the Neo4j
+  # connection details come from".
+
+  Neo4jSecurityGroupSsmParameterName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /cartography/sg/neo4j
+    Description: >-
+      Existing SSM parameter (owned by your Cartography deployment)
+      holding Neo4j's security group ID. This stack adds one ingress
+      rule to that security group (DiscoveryFunctionNeo4jIngress below;
+      see README.md "Security group design").
+
+  ImageListSsmParameterName:
+    Type: String
+    Default: /dependency-track/ghcr-scan/image-list
+    Description: >-
+      SSM Advanced-tier parameter (created by this stack) holding the
+      current JSON array of every distinct ghcr.io image reference
+      Cartography shows running on the Kubernetes fleet. Written by
+      DiscoveryFunction, read by the state machine's ScanAll Map state
+      as the fan-out source for individual scan invocations. Advanced
+      tier required -- see README.md "Why SSM Advanced, not S3 or
+      Standard tier" (the full unfiltered list measured ~6 KB at 99
+      images, over Standard's 4 KB cap).
+
+  DiscoveryMemorySizeMb:
+    Type: Number
+    Default: 256
+    Description: >-
+      Discovery is a single Cypher query + one put-parameter call, not
+      CPU-bound -- 256MB is a starting point, not derived from profiling.
+
+  DiscoveryTimeoutSeconds:
+    Type: Number
+    Default: 60
+
+  ScanMemorySizeMb:
+    Type: Number
+    Default: 2048
+    Description: >-
+      Matches dependency-track-syft-scanner's own ScanMemorySizeMb
+      default -- syft's actual memory footprint scanning a container
+      image is comparable regardless of whether the source was a git
+      tarball or a registry pull.
+
+  ScanTimeoutSeconds:
+    Type: Number
+    Default: 300
+
+  ScanEphemeralStorageSizeMb:
+    Type: Number
+    Default: 2048
+    Description: >-
+      /tmp size for the scan function -- matches
+      dependency-track-syft-scanner's own EphemeralStorageSizeMb
+      default. Registry: mode pulls layers into an internal syft cache
+      under /tmp as it scans, same as a tarball-sourced scan would.
+
+  SyftVersion:
+    Type: String
+    Default: v1.18.0
+    Description: >-
+      Matches dependency-track-syft-scanner's own SyftVersion default
+      -- keep these in sync manually; nothing enforces it, see README.md
+      "Keeping syft version in sync with dependency-track-syft-scanner".
+
+  GhcrPatSecretArn:
+    Type: String
+    Default: "REPLACE_ME"
+    Description: >-
+      ARN of a Secrets Manager secret holding {"token": "<classic PAT>"}
+      -- a classic PAT with read:packages is required (GitHub App
+      installation tokens can't use GitHub's Packages REST API). The
+      same PAT is used for the registry pull itself (syft's
+      SYFT_REGISTRY_AUTH_PASSWORD). Create it by hand
+      (e.g. dependency-track/ghcr-packages-pat) in the deploy region and
+      pass its ARN here before deploying -- placeholder default will fail
+      GetSecretValue at Lambda runtime, not at deploy time, if left
+      unset.
+
+Resources:
+  # ---------------------------------------------------------------------
+  # Security group for DiscoveryFunction (Neo4j access): a dedicated SG
+  # for this Lambda, egress to Neo4j's SG on 8443, plus a NEW ingress
+  # rule added to Neo4j's own SG (owned by your Cartography deployment,
+  # modified here) allowing this SG in. Purely additive: Neo4j's
+  # existing ingress rules are untouched. See README.md "Security group
+  # design".
+  # ---------------------------------------------------------------------
+
+  DiscoveryFunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: dependency-track-ghcr-scanner-discovery-sg
+      GroupDescription: >-
+        dependency-track-ghcr-scanner DiscoveryFunction -- outbound to
+        Neo4j (Bolt 8443) and AWS APIs (HTTPS) only.
+      VpcId: !ImportValue
+        Fn::Sub: "${DbStackName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Outbound HTTPS (SSM put-parameter, other AWS APIs)
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  DiscoveryFunctionEgressNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref DiscoveryFunctionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      DestinationSecurityGroupId: !Ref Neo4jSecurityGroupSsmParameterName
+      Description: Bolt 8443 to Cartography Neo4j
+
+  # Modifies the Cartography Neo4j security group -- see the
+  # Neo4jSecurityGroupSsmParameterName parameter's description and
+  # README.md "Security group design".
+  DiscoveryFunctionNeo4jIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref Neo4jSecurityGroupSsmParameterName
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      SourceSecurityGroupId: !Ref DiscoveryFunctionSecurityGroup
+      Description: Bolt 8443 from dependency-track-ghcr-scanner DiscoveryFunction
+
+  # ---------------------------------------------------------------------
+  # Security group for ScanFunction -- outbound-only, needs internet
+  # egress to reach ghcr.io (a public endpoint, not inside the VPC),
+  # same reasoning as dependency-track-syft-scanner's own ScanFunction
+  # needing egress to github.com. Does NOT need any access to Neo4j,
+  # DT's apiserver, or any other VPC-internal resource -- it only talks
+  # to GHCR (via the internet, through the existing NAT gateway) and to
+  # S3 (via VPC endpoint or the internet, either works).
+  # ---------------------------------------------------------------------
+
+  ScanFunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: dependency-track-ghcr-scanner-scan-sg
+      GroupDescription: >-
+        dependency-track-ghcr-scanner ScanFunction -- outbound HTTPS
+        only (GHCR pulls, S3 writes, Secrets Manager reads).
+      VpcId: !ImportValue
+        Fn::Sub: "${DbStackName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Outbound HTTPS (ghcr.io, S3, Secrets Manager)
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # IAM
+  # ---------------------------------------------------------------------
+
+  DiscoveryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # Required for a Lambda attached to a VPC to create/manage its
+        # ENIs.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: write-image-list-ssm-parameter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ImageListSsmParameterName}"
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  ScanFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-ghcr-pat-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GhcrPatSecretArn
+        - PolicyName: write-sbom-to-artifact-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub
+                  - "${BucketArn}/ghcr-sboms/*"
+                  - BucketArn: !Sub
+                      - "arn:aws:s3:::${BucketName}"
+                      - BucketName: !ImportValue
+                          Fn::Sub: "${SyftScannerStackName}-ArtifactBucketName"
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-lambdas
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DiscoveryFunction.Arn
+                  - !GetAtt ScanFunction.Arn
+                  # Cross-stack invoke of dependency-track-syft-scanner's
+                  # existing UploadFunction -- see that stack's newly
+                  # added UploadFunctionArn export and README.md
+                  # "Reusing the existing upload Lambda and artifact
+                  # bucket".
+                  - !ImportValue
+                    Fn::Sub: "${SyftScannerStackName}-UploadFunctionArn"
+        - PolicyName: read-image-list-ssm-parameter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ImageListSsmParameterName}"
+        - PolicyName: cloudwatch-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
+  # ---------------------------------------------------------------------
+  # Log groups
+  # ---------------------------------------------------------------------
+
+  DiscoveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/dependency-track-ghcr-scanner-discovery
+      RetentionInDays: 30
+
+  ScanLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/dependency-track-ghcr-scanner-scan
+      RetentionInDays: 30
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/vendedlogs/states/dependency-track-ghcr-scanner
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------
+  # Lambdas
+  # ---------------------------------------------------------------------
+
+  DiscoveryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dependency-track-ghcr-scanner-discovery
+      PackageType: Image
+      Role: !GetAtt DiscoveryFunctionRole.Arn
+      MemorySize: !Ref DiscoveryMemorySizeMb
+      Timeout: !Ref DiscoveryTimeoutSeconds
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DiscoveryFunctionSecurityGroup
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSubnet1Id"
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSubnet2Id"
+      LoggingConfig:
+        LogGroup: !Ref DiscoveryLogGroup
+      Environment:
+        Variables:
+          NEO4J_URI: "bolt://{{resolve:ssm:/cartography/neo4j/private-ip}}:8443"
+          IMAGE_LIST_SSM_PARAMETER_NAME: !Ref ImageListSsmParameterName
+      Tags:
+        Project: dependency-track
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./discovery
+      DockerTag: latest
+
+  ScanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dependency-track-ghcr-scanner-scan
+      PackageType: Image
+      Role: !GetAtt ScanFunctionRole.Arn
+      MemorySize: !Ref ScanMemorySizeMb
+      Timeout: !Ref ScanTimeoutSeconds
+      EphemeralStorage:
+        Size: !Ref ScanEphemeralStorageSizeMb
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ScanFunctionSecurityGroup
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSubnet1Id"
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-WorkloadSubnet2Id"
+      LoggingConfig:
+        LogGroup: !Ref ScanLogGroup
+      Environment:
+        Variables:
+          GHCR_PAT_SECRET_ARN: !Ref GhcrPatSecretArn
+          ARTIFACT_BUCKET: !ImportValue
+            Fn::Sub: "${SyftScannerStackName}-ArtifactBucketName"
+      Tags:
+        Project: dependency-track
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./scan
+      DockerTag: latest
+      DockerBuildArgs:
+        SYFT_VERSION: !Ref SyftVersion
+
+  # ---------------------------------------------------------------------
+  # Step Functions
+  # ---------------------------------------------------------------------
+
+  ScanAllStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: dependency-track-ghcr-scanner
+      # Standard, NOT Express -- unlike
+      # dependency-track-syft-scanner's own BatchScanStateMachine
+      # (Express, fire-and-forget startExecution per repo, self-
+      # recursion for pagination specifically to stay under Express's
+      # 5-minute cap), THIS state machine's ScanAll Map runs Scan+Upload
+      # INLINE and BLOCKING for every image, sequentially
+      # (MaxConcurrency 1) -- a full run over ~99 images at even a
+      # conservative ~10-20s/image (syft pull+scan+upload) is
+      # 15-35+ minutes, well past Express's hard cap. Standard's much
+      # longer execution ceiling (up to 1 year) and native support for
+      # long-running Map states make it the correct choice for this
+      # blocking-fan-out shape. See README.md "Standard, not Express"
+      # for the full reasoning and how this differs from the syft-
+      # scanner's own batch pattern.
+      Type: STANDARD
+      Role: !GetAtt StateMachineRole.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        DiscoveryFunctionArn: !GetAtt DiscoveryFunction.Arn
+        ScanFunctionArn: !GetAtt ScanFunction.Arn
+        UploadFunctionArn: !ImportValue
+          Fn::Sub: "${SyftScannerStackName}-UploadFunctionArn"
+        ImageListSsmParameterName: !Ref ImageListSsmParameterName
+      Definition:
+        Comment: >-
+          Refreshes the GHCR image list from Cartography, then scans
+          and uploads every image in it. Input: {} (default) does a
+          full Discover (overwrites the SSM image list from a live
+          Cartography query) + full re-scan of everything in it.
+          Input: {"images": ["ghcr.io/example-org/foo:bar", ...]} SKIPS
+          Discover entirely and scans exactly that caller-supplied
+          list instead -- for testing a single image (or a small
+          handful) without touching the SSM parameter or waiting on a
+          full Cartography query. See README.md "Testing a single
+          image" for the exact invocation. MaxConcurrency 1 on the
+          ScanAll Map, same conservative-pacing reasoning as
+          dependency-track-syft-scanner's own MapRepos -- see README.md
+          "Concurrency" for why this starts at 1.
+        QueryLanguage: JSONata
+        StartAt: CheckForTestImages
+        States:
+          # {"images": [...]} in the execution input takes precedence
+          # over a real Discover -- see README.md "Testing a single
+          # image". Checks for a non-empty array specifically (not
+          # just key presence) so {"images": []} or an execution
+          # started with no input at all both fall through to the
+          # real Discover path, not an empty/no-op scan.
+          CheckForTestImages:
+            Type: Choice
+            Choices:
+              - Condition: "{% $exists($states.input.images) and $count($states.input.images) > 0 %}"
+                Assign:
+                  images: "{% $states.input.images %}"
+                Next: ScanAll
+            Default: Discover
+          Discover:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: "${DiscoveryFunctionArn}"
+              Payload: {}
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: GetImageList
+          GetImageList:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: "${ImageListSsmParameterName}"
+            Assign:
+              images: "{% $parse($states.result.Parameter.Value) %}"
+            Next: ScanAll
+          ScanAll:
+            Type: Map
+            Items: "{% $images %}"
+            MaxConcurrency: 1
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: Scan
+              States:
+                Scan:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Arguments:
+                    FunctionName: "${ScanFunctionArn}"
+                    Payload:
+                      image: "{% $states.input %}"
+                  Output:
+                    bucket: "{% $states.result.Payload.bucket %}"
+                    key: "{% $states.result.Payload.key %}"
+                    project_name: "{% $states.result.Payload.project_name %}"
+                    project_version: "{% $states.result.Payload.project_version %}"
+                    # scan/app.py also emits owner/repo/sbom_source
+                    # (added so Upload's shared _build_tags can branch
+                    # correctly for GHCR projects instead of falling
+                    # into the git-repo defaults -- org:unknown,
+                    # repo:unknown, archived:false, fork:false,
+                    # visibility:unknown -- confirmed as the actual
+                    # live bug via a real upload before this fix: this
+                    # Output block was whitelisting fields and silently
+                    # dropping these three before they ever reached
+                    # Upload's Payload).
+                    owner: "{% $states.result.Payload.owner %}"
+                    repo: "{% $states.result.Payload.repo %}"
+                    sbom_source: "{% $states.result.Payload.sbom_source %}"
+                  Retry:
+                    - ErrorEquals:
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                        - Lambda.TooManyRequestsException
+                      IntervalSeconds: 5
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals:
+                        - States.ALL
+                      Output:
+                        error: "{% $states.errorOutput %}"
+                      Next: ScanFailed
+                  Next: Upload
+                Upload:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Arguments:
+                    FunctionName: "${UploadFunctionArn}"
+                    Payload: "{% $states.input %}"
+                  Output:
+                    project_name: "{% $states.result.Payload.project_name %}"
+                    project_version: "{% $states.result.Payload.project_version %}"
+                    status: "{% $states.result.Payload.status %}"
+                  Retry:
+                    - ErrorEquals:
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                        - Lambda.TooManyRequestsException
+                      IntervalSeconds: 5
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals:
+                        - States.ALL
+                      Output:
+                        error: "{% $states.errorOutput %}"
+                      Next: UploadFailed
+                  End: true
+                ScanFailed:
+                  Type: Fail
+                  Error: ScanFailed
+                  Cause: syft registry scan or SBOM upload to S3 failed
+                UploadFailed:
+                  Type: Fail
+                  Error: UploadFailed
+                  Cause: Dependency-Track BOM upload failed
+            End: true
+      Tags:
+        Project: dependency-track
+
+Outputs:
+  DiscoveryFunctionArn:
+    Value: !GetAtt DiscoveryFunction.Arn
+
+  ScanFunctionArn:
+    Value: !GetAtt ScanFunction.Arn
+
+  StateMachineArn:
+    Value: !Ref ScanAllStateMachine
+
+  ImageListSsmParameterName:
+    Value: !Ref ImageListSsmParameterName
