@@ -1,5 +1,5 @@
 # Copy to samconfig.toml (gitignored). Optional stack: requires Cartography
-# (Neo4j) in the same VPC. Create the PAT secret by hand first.
+# (Neo4j) in the same VPC. Set the PAT secret after the first deploy.
 version = 0.1
 
 [default.deploy.parameters]
@@ -10,4 +10,4 @@ resolve_s3 = true
 resolve_image_repos = true
 confirm_changeset = false
 fail_on_empty_changeset = false
-parameter_overrides = "SyftScannerStackName=dependency-track-syft-scanner DbStackName=dependency-track-db GhcrPatSecretArn=arn:aws:secretsmanager:us-east-1:111122223333:secret:REPLACE_ME"
+parameter_overrides = "SyftScannerStackName=dependency-track-syft-scanner DbStackName=dependency-track-db"

@@ -107,21 +107,28 @@ Parameters:
       -- keep these in sync manually; nothing enforces it, see README.md
       "Keeping syft version in sync with dependency-track-syft-scanner".
 
-  GhcrPatSecretArn:
-    Type: String
-    Default: "REPLACE_ME"
-    Description: >-
-      ARN of a Secrets Manager secret holding {"token": "<classic PAT>"}
-      -- a classic PAT with read:packages is required (GitHub App
-      installation tokens can't use GitHub's Packages REST API). The
-      same PAT is used for the registry pull itself (syft's
-      SYFT_REGISTRY_AUTH_PASSWORD). Create it by hand
-      (e.g. dependency-track/ghcr-packages-pat) in the deploy region and
-      pass its ARN here before deploying -- placeholder default will fail
-      GetSecretValue at Lambda runtime, not at deploy time, if left
-      unset.
-
 Resources:
+  # ---------------------------------------------------------------------
+  # Secret -- empty placeholder at stack creation, same idiom as
+  # dependency-track-syft-scanner's secrets: fill in post-deploy (see
+  # README). A classic PAT with read:packages is required (GitHub App
+  # installation tokens can't use GitHub's Packages REST API). The same
+  # PAT is used for the registry pull itself (syft's
+  # SYFT_REGISTRY_AUTH_PASSWORD).
+  # ---------------------------------------------------------------------
+
+  GhcrPatSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: dependency-track/ghcr-packages-pat
+      Description: >-
+        GitHub classic PAT with read:packages, as {"token": "<PAT>"}.
+        Blank at stack creation; fill in post-deploy (see README).
+      SecretString: '{"token":""}'
+      Tags:
+        - Key: Project
+          Value: dependency-track
+
   # ---------------------------------------------------------------------
   # Security group for DiscoveryFunction (Neo4j access): a dedicated SG
   # for this Lambda, egress to Neo4j's SG on 8443, plus a NEW ingress
@@ -253,7 +260,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Ref GhcrPatSecretArn
+                Resource: !Ref GhcrPatSecret
         - PolicyName: write-sbom-to-artifact-bucket
           PolicyDocument:
             Version: "2012-10-17"
@@ -400,7 +407,7 @@ Resources:
         LogGroup: !Ref ScanLogGroup
       Environment:
         Variables:
-          GHCR_PAT_SECRET_ARN: !Ref GhcrPatSecretArn
+          GHCR_PAT_SECRET_ARN: !Ref GhcrPatSecret
           ARTIFACT_BUCKET: !ImportValue
             Fn::Sub: "${SyftScannerStackName}-ArtifactBucketName"
       Tags:

@@ -49,29 +49,31 @@ Amazon Inspector can't scan GHCR. This stack fills that gap. It extends `depende
 | `ScanMemorySizeMb` / `ScanTimeoutSeconds` | `2048` / `300` | |
 | `ScanEphemeralStorageSizeMb` | `2048` | `/tmp` for syft's layer cache |
 | `SyftVersion` | `v1.18.0` | Keep in sync with `dependency-track-syft-scanner` |
-| `GhcrPatSecretArn` | `REPLACE_ME` | **Required.** See below |
 
 The Neo4j IP SSM name (`/cartography/neo4j/private-ip`) is hardcoded in `template.yaml`. SAM transforms don't allow a CloudFormation parameter inside a `{{resolve:ssm:...}}` reference.
-
-## Secret setup
-
-Create the secret by hand in your home region:
-
-```bash
-aws secretsmanager create-secret \
-  --name dependency-track/ghcr-packages-pat \
-  --secret-string '{"token": "<classic PAT>"}'
-```
-
-Pass its ARN as `GhcrPatSecretArn`. If left as `REPLACE_ME`, the deploy succeeds but `ScanFunction` fails at runtime.
 
 ## Deploy
 
 ```bash
-cp samconfig.example.toml samconfig.toml   # gitignored; set region and GhcrPatSecretArn
+cp samconfig.example.toml samconfig.toml   # gitignored; set region
 sam build
 sam deploy
 ```
+
+## Secret setup
+
+The stack creates `dependency-track/ghcr-packages-pat` with an empty
+token. After the first deploy, set it to a classic PAT with
+`read:packages`:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id dependency-track/ghcr-packages-pat \
+  --secret-string '{"token": "<classic PAT>"}'
+```
+
+Until then, `ScanFunction` fails at runtime. The secret is deleted with
+the stack.
 
 ## Run
 
