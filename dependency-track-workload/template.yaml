@@ -393,7 +393,7 @@ Resources:
           echo "$DEVICE /opt/dtrack-data xfs defaults,nofail 0 2" >> /etc/fstab
           chmod 777 /opt/dtrack-data
 
-          systemctl enable --now ecs
+          systemctl enable --now --no-block ecs
       Tags:
         - Key: Name
           Value: dependency-track-workload
